@@ -271,7 +271,72 @@ curl -sS -X POST $STILL_URL/api/applications/hello/rollback \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-This runs a full rolling deploy using the prior deployment's artifact. Rollback is strictly one step back; to go further, deploy an older version as a new deployment.
+For immutable releases, rollback selects the preceding completed, distinct
+application revision: exact artifact bytes plus the saved process configuration.
+Unchanged restarts do not introduce a new rollback target; a restart that changed
+environment variables can. Current domain, path, and maintenance settings are
+not rolled back. Each agent must already have the verified target release on disk;
+a missing target fails explicitly rather than substituting that host's local
+previous version. A second consecutive rollback is rejected. To select another
+version, submit it as a new deployment.
+
+### Immutable releases and upgrade notes
+
+New deployments keep the existing `version` / `artifact_url` request format, but
+bind it to an immutable release and process-configuration revision. Deployment
+responses include nullable `release_id` and `revision_id` fields; they are filled
+after staging succeeds. Legacy and not-yet-staged records have null IDs.
+
+- Every new deploy submission downloads and validates its artifact, even when the
+  same version was deployed before. Identical bytes reuse the release; different
+  bytes for the same application/version fail the asynchronous deployment with
+  `version_content_conflict`. Publish a new version for changed content.
+- Controller artifacts are stored as `<application>/<sha256>.tar.gz`; agent release
+  directories use internal UUIDs. Version labels are no longer filesystem identities.
+  `current_blue` / `current_green` and `STILL_RELEASE_VERSION` retain their meanings.
+  The controller's private staging directory is a sibling of `artifacts_dir` and
+  must share its filesystem for atomic hard-link publication. Mount their common
+  parent when placing artifact storage on a separate volume.
+- The controller verifies the tarball before publishing it. The agent verifies its
+  digest and size before extraction and publishes a new directory only after
+  extraction succeeds. Existing release directories are never unpacked over.
+- Supported archives contain regular files, directories, and relative symlinks
+  accepted by Erlang's safe tar extractor. Absolute/traversal paths, escaping links,
+  duplicate normalized paths, hard links, device files, setuid/setgid bits, and the
+  reserved `.still-artifact.json` marker name are rejected. If a package uses hard
+  links or unsupported symlink layouts, package dereferenced regular files instead.
+- Default limits are 512 MiB compressed, 2 GiB declared expanded size, and 100,000
+  entries. Configure `:artifact_max_bytes`, `:artifact_max_expanded_bytes`, and
+  `:artifact_max_entries` under `config :still`. The compressed size is checked
+  after download; these are verification limits, not network/disk quotas.
+- Digests pin bytes and detect transfer corruption; they do **not** authenticate
+  the publisher. Artifact signature verification is not implemented in this phase.
+- Revisions retain historical environment values and hooks in the database.
+  Configuration snapshots are redacted from inspection/audits and omitted from
+  deployment API responses. Protect database backups as secrets. Rollback can
+  restore old environment values; the application's editable configuration remains
+  the desired configuration for the next deployment/restart.
+- Automatic artifact pruning is disabled conservatively. Offline hosts may still
+  reference old releases. Monitor disk usage; retain artifacts, revisions, and agent
+  directories together until reference-aware garbage collection is available.
+
+**Upgrade with deployments paused.** Back up the controller database and agent
+state first. Upgrade the controller and all agents, then wait for agents to
+reconnect before resuming deploys. The controller refuses immutable deployments
+to agents that do not advertise the `immutable_releases` capability.
+
+The additive migration does not fabricate identities for old deployments or move
+old release directories. Existing applications keep their files. Controller-driven
+restart/rollback of a legacy deployment without a verified release identity fails
+with `legacy_release_unverified`. Submit a trusted artifact as a new deployment to
+establish its identity; no old directory is deleted or modified by that migration.
+Once new deployments exist, do not downgrade only the binaries: older agents do
+not understand the new directory identities. Restore a coordinated backup if a
+downgrade is necessary.
+
+This phase does not add durable asynchronous operations, atomic fleet rollback,
+or crash recovery between traffic switching and state persistence. Those remain
+later milestones in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
 ## Restart
 

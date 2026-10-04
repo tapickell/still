@@ -66,18 +66,23 @@ defmodule Still.Integration.ElixirReleaseExecLifecycleTest do
     start_supervised!(DeploymentManager)
 
     # First deploy lands on blue: systemd expands `%i`→`blue`, follows
-    # `current_blue` → releases/0.0.1-a, and the binary serves.
+    # `current_blue` → releases/<internal-id>, and the binary serves.
     assert {:ok, "0.0.1-a"} = DeploymentManager.deploy(spec_a)
     assert fetch_body(caddy.http_port, "/") =~ "vA"
-    assert File.read_link!(Path.join(app_dir, "current_blue")) =~ "releases/0.0.1-a"
+    blue_release = File.read_link!(Path.join(app_dir, "current_blue"))
+    assert {:ok, _} = Ecto.UUID.cast(Path.basename(blue_release))
+    assert Path.dirname(blue_release) == Path.join(app_dir, "releases")
     assert slot_env(app_dir, "blue") =~ "STILL_RELEASE_VERSION=0.0.1-a"
     assert slot_env(app_dir, "blue") =~ "STILL_TARGET_SLOT=blue"
 
     # Second deploy flips to green with the *same* templated unit: `%i`→`green`,
-    # `current_green` → releases/0.0.1-b. Confirms `current_%i` tracks the slot.
+    # `current_green` → another immutable release. Confirms `%i` tracks the slot.
     assert {:ok, "0.0.1-b"} = DeploymentManager.deploy(spec_b)
     assert fetch_body(caddy.http_port, "/") =~ "vB"
-    assert File.read_link!(Path.join(app_dir, "current_green")) =~ "releases/0.0.1-b"
+    green_release = File.read_link!(Path.join(app_dir, "current_green"))
+    assert {:ok, _} = Ecto.UUID.cast(Path.basename(green_release))
+    refute green_release == blue_release
+    assert File.exists?(blue_release)
     assert slot_env(app_dir, "green") =~ "STILL_RELEASE_VERSION=0.0.1-b"
     assert slot_env(app_dir, "green") =~ "STILL_TARGET_SLOT=green"
     # The previous slot's env file is untouched, so blue still reports its own

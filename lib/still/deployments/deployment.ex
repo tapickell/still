@@ -11,6 +11,7 @@ defmodule Still.Deployments.Deployment do
   alias Still.Deployments.DeploymentStep
 
   @statuses [:pending, :in_progress, :completed, :failed, :rolled_back]
+  @type t :: %__MODULE__{}
 
   schema "deployments" do
     field :version, :string
@@ -21,6 +22,15 @@ defmodule Still.Deployments.Deployment do
     field :error, :string
     field :started_at, :utc_datetime_usec
     field :completed_at, :utc_datetime_usec
+    field :process_snapshot, :map, redact: true
+
+    field :operation_kind, Ecto.Enum,
+      values: [:deploy, :rollback, :restart],
+      virtual: true,
+      default: :deploy
+
+    belongs_to :release, Still.Releases.Release
+    belongs_to :revision, Still.Releases.Revision
 
     belongs_to :application, Application
 
@@ -71,6 +81,9 @@ defmodule Still.Deployments.Deployment do
     |> cast(attrs, [:version, :artifact_url, :initiated_by, :source])
     |> validate_required([:version, :artifact_url, :initiated_by])
     |> validate_length(:version, min: 1, max: 255)
+    |> validate_format(:version, ~r/\A[a-zA-Z0-9][a-zA-Z0-9._+-]*\z/,
+      message: "must be a safe version identifier without path separators"
+    )
     |> validate_length(:artifact_url, min: 1, max: 2048)
     |> validate_length(:initiated_by, min: 1, max: 255)
     |> validate_length(:source, min: 1, max: 255)

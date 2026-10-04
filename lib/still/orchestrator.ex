@@ -29,6 +29,7 @@ defmodule Still.Orchestrator do
   alias Still.Deployments
   alias Still.Deployments.FailureReason
   alias Still.Protocol.DeployRequest
+  alias Still.Releases
 
   # Fire-and-forget deploy/route tasks run under this supervisor (started in
   # Still.Application.common_children) so a crashing task can't take the
@@ -45,10 +46,11 @@ defmodule Still.Orchestrator do
       `trigger_rollback/2`. The agent interprets the same struct as a rollback.
     * `:restart_agent_caller` — 2-arity fn with the same shape, used for
       `trigger_restart/2`. The agent interprets the same struct as a restart.
-    * `:artifact_stager` — 2-arity fn `(application, deployment) -> :ok | {:error, reason}`
+    * `:artifact_stager` — 2-arity fn `(application, deployment) -> {:ok, deployment} | {:error, reason}`
       that stages the artifact on the controller before fanning out to agents.
       Defaults to `&default_artifact_stager/2` which downloads via the
-      application's artifact provider and caches locally.
+      application's artifact provider and binds immutable release/revision records.
+      Tests may return `:ok` to leave the deployment unchanged.
     * `:notifier` — pid to receive `{:deployment_complete, id, :completed | :failed}`
       after either a deploy or a rollback finishes.
   """
@@ -291,11 +293,17 @@ defmodule Still.Orchestrator do
       nil ->
         {:error, :no_rollback_target}
 
-      %{version: version, artifact_url: artifact_url} ->
+      %{version: version, artifact_url: artifact_url} = target ->
         attrs =
           attrs
           |> Map.put_new(:source, "rollback")
-          |> Map.merge(%{version: version, artifact_url: artifact_url})
+          |> Map.merge(%{
+            version: version,
+            artifact_url: artifact_url,
+            release_id: target.release_id,
+            revision_id: target.revision_id,
+            operation_kind: :rollback
+          })
 
         validate_and_create(actor, application, attrs)
     end
@@ -314,11 +322,16 @@ defmodule Still.Orchestrator do
       nil ->
         {:error, :not_deployed}
 
-      %{version: version, artifact_url: artifact_url} ->
+      %{version: version, artifact_url: artifact_url} = target ->
         attrs =
           attrs
           |> Map.put_new(:source, "restart")
-          |> Map.merge(%{version: version, artifact_url: artifact_url})
+          |> Map.merge(%{
+            version: version,
+            artifact_url: artifact_url,
+            release_id: target.release_id,
+            operation_kind: :restart
+          })
 
         validate_and_create(actor, application, attrs)
     end
@@ -385,9 +398,9 @@ defmodule Still.Orchestrator do
 
     # six:ignore:start
     result =
-      with :ok <- stage_artifact(application, deployment, artifact_stager) do
+      with {:ok, prepared} <- stage_artifact(application, deployment, artifact_stager) do
         Enum.reduce_while(servers, :ok, fn as, :ok ->
-          deploy_to_server(deployment, application, as, agent_caller)
+          deploy_to_server(prepared, application, as, agent_caller)
         end)
       end
 
@@ -453,7 +466,10 @@ defmodule Still.Orchestrator do
   defp stage_artifact(application, deployment, artifact_stager) do
     case artifact_stager.(application, deployment) do
       :ok ->
-        :ok
+        {:ok, deployment}
+
+      {:ok, prepared} ->
+        {:ok, prepared}
 
       {:error, reason} = err ->
         Logger.warning(
@@ -476,10 +492,22 @@ defmodule Still.Orchestrator do
       nil ->
         fail_step(deployment, application, application_server, step, :agent_disconnected)
 
-      %{node: node} ->
+      %{node: node} = report ->
         step = Deployments.start_deployment_step!(step)
 
-        case agent_caller.(node, spec) do
+        result =
+          if deployment.release_id &&
+               :immutable_releases not in Map.get(report, :capabilities, []) do
+            {:error, :agent_upgrade_required}
+          else
+            agent_caller.(node, spec)
+          end
+
+        case result do
+          {:ok, version}
+          when not is_nil(deployment.release_id) and version != deployment.version ->
+            fail_step(deployment, application, application_server, step, :agent_version_mismatch)
+
           {:ok, _version} ->
             complete_step(deployment, application, application_server, step)
 
@@ -543,7 +571,11 @@ defmodule Still.Orchestrator do
   end
 
   defp build_deploy_request(application, deployment, application_server) do
-    %DeployRequest{
+    # Process settings are snapshotted, but routing remains live. Refresh it
+    # after staging and between hosts instead of restoring a revision's routes.
+    application = Applications.get_application_by_name!(application.name)
+
+    spec = %DeployRequest{
       application: application.name,
       type: application.type,
       version: deployment.version,
@@ -551,6 +583,8 @@ defmodule Still.Orchestrator do
       deployment_id: deployment.id,
       domain: application.domain,
       path_prefix: application.path_prefix,
+      maintenance: application.maintenance,
+      maintenance_message: application.maintenance_message,
       env_vars: application.env_vars,
       exec_command: application.exec_command,
       exec_start_pre: application.exec_start_pre,
@@ -560,6 +594,22 @@ defmodule Still.Orchestrator do
       port_blue: application_server.port_blue,
       port_green: application_server.port_green
     }
+
+    if deployment.release_id do
+      deployment = Releases.load(deployment)
+
+      spec
+      |> Map.merge(Releases.process_fields(deployment.revision))
+      |> Map.merge(%{
+        release_id: deployment.release_id,
+        revision_id: deployment.revision_id,
+        artifact_digest: deployment.release.digest,
+        artifact_size: deployment.release.size,
+        artifact_url: ArtifactStore.artifact_url(application.name, deployment.release.digest)
+      })
+    else
+      spec
+    end
   end
 
   # Turn the application's hook rows into the map the agent's
@@ -576,19 +626,10 @@ defmodule Still.Orchestrator do
 
   # six:ignore:start
   defp default_artifact_stager(application, deployment) do
-    source_type = application.artifact_source.type
-    spec = %{artifact_url: deployment.artifact_url}
-
-    case ArtifactStore.stage(application.name, deployment.version,
-           source_type: source_type,
-           spec: spec
-         ) do
-      {:ok, _path} ->
-        ArtifactStore.prune(application.name)
-        :ok
-
-      {:error, reason} ->
-        {:error, "artifact staging failed: #{inspect(reason)}"}
+    if deployment.operation_kind in [:rollback, :restart] and is_nil(deployment.release_id) do
+      {:error, :legacy_release_unverified}
+    else
+      Releases.prepare(application, deployment)
     end
   end
 

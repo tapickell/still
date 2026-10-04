@@ -1,6 +1,7 @@
 defmodule Still.ArtifactStoreTest do
   use ExUnit.Case, async: false
 
+  alias Still.Artifact.Archive
   alias Still.ArtifactStore
 
   setup do
@@ -14,6 +15,7 @@ defmodule Still.ArtifactStoreTest do
 
     on_exit(fn ->
       File.rm_rf!(dir)
+      File.rm_rf!(dir <> ".staging")
 
       if original_dir,
         do: Application.put_env(:still, :artifacts_dir, original_dir),
@@ -30,7 +32,11 @@ defmodule Still.ArtifactStoreTest do
   describe "stage/3" do
     test "downloads the artifact and returns the local path", %{dir: dir} do
       src = Path.join(dir, "source.tar.gz")
-      File.write!(src, "artifact-content")
+
+      :ok =
+        :erl_tar.create(String.to_charlist(src), [{~c"index.html", "artifact-content"}], [
+          :compressed
+        ])
 
       assert {:ok, path} =
                ArtifactStore.stage("my-app", "1.0.0",
@@ -38,16 +44,18 @@ defmodule Still.ArtifactStoreTest do
                  spec: %{artifact_url: src}
                )
 
-      assert File.read!(path) == "artifact-content"
-      assert path == Path.join([dir, "my-app", "1.0.0.tar.gz"])
+      assert File.read!(path) == File.read!(src)
+      {:ok, %{digest: digest}} = Archive.metadata(src)
+      assert path == Path.join([dir, "my-app", "#{digest}.tar.gz"])
+      assert File.ls!(dir <> ".staging") == []
     end
 
-    test "skips download when the artifact is already staged", %{dir: dir} do
+    test "never treats an existing legacy version cache as verified content", %{dir: dir} do
       staged = Path.join([dir, "my-app", "1.0.0.tar.gz"])
       File.mkdir_p!(Path.dirname(staged))
       File.write!(staged, "already-here")
 
-      assert {:ok, ^staged} =
+      assert {:error, _} =
                ArtifactStore.stage("my-app", "1.0.0",
                  source_type: :local_file,
                  spec: %{artifact_url: "/nonexistent"}
@@ -76,10 +84,36 @@ defmodule Still.ArtifactStoreTest do
   end
 
   describe "artifact_url/2" do
+    test "rejects unsafe URL and path components" do
+      assert_raise ArgumentError, fn -> ArtifactStore.artifact_url("../app", "1.0") end
+      assert_raise ArgumentError, fn -> ArtifactStore.artifact_path("app", "../../outside") end
+      assert {:error, :unsafe_artifact_identifier} = ArtifactStore.stage("app", "../bad", [])
+    end
+
     test "returns the internal HTTP URL for the given app and version" do
       assert ArtifactStore.artifact_url("my-app", "1.0.0") ==
                "http://controller:9090/artifacts/my-app/1.0.0.tar.gz"
     end
+  end
+
+  test "concurrent staging publishes one complete object and refuses a corrupted existing object",
+       %{dir: dir} do
+    source = Path.join(dir, "source.tar.gz")
+    :ok = :erl_tar.create(String.to_charlist(source), [{~c"index.html", "hello"}], [:compressed])
+    opts = [source_type: :local_file, spec: %{artifact_url: source}]
+
+    results =
+      1..4
+      |> Task.async_stream(fn _ -> ArtifactStore.stage("app", "1.0", opts) end)
+      |> Enum.to_list()
+
+    assert [{:ok, {:ok, path}} | _] = results
+    assert Enum.all?(results, &(&1 == {:ok, {:ok, path}}))
+    assert File.read!(path) == File.read!(source)
+    assert File.ls!(dir <> ".staging") == []
+    File.write!(path, "damaged")
+    assert {:error, :artifact_mismatch} = ArtifactStore.stage("app", "1.0", opts)
+    assert File.read!(path) == "damaged"
   end
 
   describe "artifact_path/2" do
@@ -90,7 +124,9 @@ defmodule Still.ArtifactStoreTest do
   end
 
   describe "prune/2" do
-    test "keeps the most recent N versions and deletes the rest", %{dir: dir} do
+    test "retains all artifacts because an offline agent may still reference any version", %{
+      dir: dir
+    } do
       app_dir = Path.join(dir, "prunable")
       File.mkdir_p!(app_dir)
 
@@ -103,9 +139,9 @@ defmodule Still.ArtifactStoreTest do
 
       deleted = ArtifactStore.prune("prunable", 3)
 
-      assert length(deleted) == 2
+      assert deleted == []
       remaining = File.ls!(app_dir) |> Enum.sort()
-      assert length(remaining) == 3
+      assert length(remaining) == 5
     end
 
     test "returns an empty list when the app directory does not exist" do

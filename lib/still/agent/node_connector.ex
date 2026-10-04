@@ -207,6 +207,7 @@ defmodule Still.Agent.NodeConnector do
       node: Node.self(),
       connected_at: DateTime.utc_now(),
       system_info: SystemInfo.collect(),
+      capabilities: [:immutable_releases],
       applications: current_applications()
     }
   end
@@ -230,6 +231,10 @@ defmodule Still.Agent.NodeConnector do
       active_port: state.active_port,
       current_version: state.current_version,
       previous_version: state.previous_version,
+      current_release_id: state.current_release_id,
+      previous_release_id: state.previous_release_id,
+      current_revision_id: state.current_revision_id,
+      previous_revision_id: state.previous_revision_id,
       last_health_check_at: state.last_health_check_at,
       pid: runtime.pid,
       active_state: runtime.active_state,

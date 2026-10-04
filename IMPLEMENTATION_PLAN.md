@@ -6,6 +6,19 @@
 
 **Related document:** [PROJECT_REVIEW_AND_AUTOSCALING.md](PROJECT_REVIEW_AND_AUTOSCALING.md)
 
+### Phase 1 implementation notes
+
+Phase 1 code now includes release/revision schemas, content-addressed verified
+staging, immutable agent directories, exact rollback references, private process
+snapshots, and conservative artifact retention. It also includes the path-safety
+and maintenance-payload fixes needed by those paths. See the README's immutable
+release section for compatibility and upgrade requirements.
+
+This is not completion of the later coordination phases: timeouts, interrupted
+switch recovery, concurrent routing mutations, and fleet-wide convergence still
+require Phases 2–3. Real Linux/Caddy/systemd qualification remains a release gate;
+passing unit tests alone does not establish that gate.
+
 ## 1. Objective
 
 Strengthen Still's deployment coordination and recovery using the most applicable

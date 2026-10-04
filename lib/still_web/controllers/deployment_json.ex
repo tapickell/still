@@ -36,6 +36,8 @@ defmodule StillWeb.DeploymentJSON do
     %{
       id: deployment.id,
       application_id: deployment.application_id,
+      release_id: deployment.release_id,
+      revision_id: deployment.revision_id,
       version: deployment.version,
       artifact_url: deployment.artifact_url,
       status: deployment.status,

@@ -24,7 +24,9 @@ defmodule Still.Agent.DeploymentManagerTest do
   alias Still.Agent.ApplicationState
   alias Still.Agent.CaddyManager
   alias Still.Agent.DeploymentManager
+  alias Still.Agent.ReleaseFiles
   alias Still.Agent.StatePersistence
+  alias Still.Artifact.Archive
 
   # ExUnit-shaped wrapper over setup_tmp_applications_dir/0 so it can be
   # used with `setup :tmp_applications_dir`.
@@ -500,7 +502,7 @@ defmodule Still.Agent.DeploymentManagerTest do
 
     test ":static_site rollback flips caddy, cleans up, and runs pre/post hooks" do
       names = DeploymentManager.default_rollback_steps_for(:static_site) |> Enum.map(&elem(&1, 0))
-      assert names == [:pre_rollback, :switching, :cleanup, :post_rollback]
+      assert names == [:pre_rollback, :symlinking, :switching, :cleanup, :post_rollback]
     end
   end
 
@@ -860,6 +862,55 @@ defmodule Still.Agent.DeploymentManagerTest do
 
       assert [%{"handler" => "reverse_proxy", "upstreams" => [%{"dial" => "localhost:4002"}]}] =
                off_route["handle"]
+    end
+  end
+
+  describe "exact release restart" do
+    setup :tmp_applications_dir
+
+    test "verifies the target and refuses a host running a different release", %{tmp_dir: dir} do
+      id = Ecto.UUID.generate()
+      tar = Path.join(dir, "release.tar.gz")
+      :ok = :erl_tar.create(String.to_charlist(tar), [{~c"index.html", "hello"}], [:compressed])
+      {:ok, meta} = Archive.metadata(tar)
+
+      spec =
+        valid_spec(%{
+          application: "exact-restart",
+          release_id: id,
+          artifact_digest: meta.digest,
+          artifact_size: meta.size
+        })
+
+      destination = Path.join([dir, spec.application, "releases", id])
+      assert :ok = ReleaseFiles.install(tar, destination, spec)
+
+      StatePersistence.write(spec.application, %ApplicationState{
+        active_slot: "blue",
+        current_version: spec.version,
+        current_release_id: id
+      })
+
+      state = %{restart_step_provider: fn _ -> [] end}
+
+      assert {:reply, {:ok, _}, _} =
+               DeploymentManager.handle_call({:restart, spec}, self(), state)
+
+      StatePersistence.write(spec.application, %ApplicationState{
+        active_slot: "blue",
+        current_version: spec.version,
+        current_release_id: Ecto.UUID.generate()
+      })
+
+      assert {:reply, {:error, :current_release_mismatch}, _} =
+               DeploymentManager.handle_call({:restart, spec}, self(), state)
+
+      assert {:reply, {:error, :unverified_existing_release}, _} =
+               DeploymentManager.handle_call(
+                 {:restart, %{spec | artifact_digest: "wrong"}},
+                 self(),
+                 state
+               )
     end
   end
 
