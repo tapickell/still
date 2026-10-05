@@ -62,6 +62,19 @@ defmodule Still.IntegrationFixtures do
   """
   def path(name) when is_atom(name) do
     fixture = Map.fetch!(@fixtures, name)
+
+    case {name, System.get_env("STILL_RELEASE_FIXTURES_DIR")} do
+      {release, dir} when release in [:release_a, :release_b] and is_binary(dir) ->
+        path = Path.join(dir, fixture.filename)
+        unless File.regular?(path), do: raise("Missing native release fixture: #{path}")
+        path
+
+      _ ->
+        cached_path(fixture)
+    end
+  end
+
+  defp cached_path(fixture) do
     cached = Path.join(@cache_dir, fixture.filename)
 
     if cached?(cached, fixture.size) do

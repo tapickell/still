@@ -39,6 +39,10 @@ defmodule Still.Deployments do
       %Deployment{}
       |> Deployment.creation_changeset(attrs)
       |> Ecto.Changeset.put_change(:application_id, application.id)
+      |> Ecto.Changeset.put_change(:process_snapshot, Still.Releases.snapshot(application))
+      |> Ecto.Changeset.put_change(:release_id, Map.get(attrs, :release_id))
+      |> Ecto.Changeset.put_change(:revision_id, Map.get(attrs, :revision_id))
+      |> Ecto.Changeset.put_change(:operation_kind, Map.get(attrs, :operation_kind, :deploy))
 
     multi =
       Ecto.Multi.new()
@@ -458,6 +462,19 @@ defmodule Still.Deployments do
   the first rollback just escaped.
   """
   def get_rollback_target(%Application{} = application) do
+    case get_current_deployment(application) do
+      %Deployment{source: "rollback"} ->
+        nil
+
+      %Deployment{revision_id: id} = current when not is_nil(id) ->
+        Still.Releases.previous_completed(application, current)
+
+      _ ->
+        legacy_rollback_target(application)
+    end
+  end
+
+  defp legacy_rollback_target(application) do
     Repo.all(
       from d in Deployment,
         where: d.application_id == ^application.id and d.status == :completed,
@@ -465,10 +482,6 @@ defmodule Still.Deployments do
         limit: 2
     )
     |> case do
-      # Current live deployment is already a rollback — nothing further back.
-      # Without this, the `previous` below is the version that rollback escaped,
-      # so a second consecutive rollback would bounce straight back onto it.
-      [%Deployment{source: "rollback"} | _] -> nil
       [_current, %Deployment{} = previous] -> previous
       _ -> nil
     end

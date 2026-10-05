@@ -12,6 +12,7 @@ concurrency:
 
 env:
   MIX_ENV: test
+  STILL_STRICT_INTEGRATION: "1"
 
 jobs:
   test:
@@ -152,7 +153,10 @@ jobs:
       - name: Install Bats
         run: |
           sudo apt-get update
-          sudo apt-get install -y bats
+          sudo apt-get install -y bats shellcheck
+
+      - name: Check Linux test runner scripts
+        run: shellcheck scripts/test-linux.sh infra/test/*.sh
 
       - name: Run installer tests
-        run: bats test/scripts/install_test.bats
+        run: bats test/scripts/install_test.bats test/scripts/test_linux_test.bats

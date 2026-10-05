@@ -11,6 +11,20 @@ defmodule StillWeb.Schemas.Deployment do
     properties: %{
       id: %OpenApiSpex.Schema{type: :string, format: :uuid},
       application_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+      release_id: %OpenApiSpex.Schema{
+        type: :string,
+        format: :uuid,
+        nullable: true,
+        description:
+          "Verified immutable artifact identity; null for legacy or unstaged deployments."
+      },
+      revision_id: %OpenApiSpex.Schema{
+        type: :string,
+        format: :uuid,
+        nullable: true,
+        description:
+          "Immutable process-configuration revision; configuration is not exposed here."
+      },
       version: %OpenApiSpex.Schema{type: :string},
       artifact_url: %OpenApiSpex.Schema{type: :string},
       status: %OpenApiSpex.Schema{

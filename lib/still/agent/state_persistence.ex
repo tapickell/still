@@ -96,6 +96,10 @@ defmodule Still.Agent.StatePersistence do
       active_port: map["active_port"],
       current_version: map["current_version"],
       previous_version: map["previous_version"],
+      current_release_id: map["current_release_id"],
+      previous_release_id: map["previous_release_id"],
+      current_revision_id: map["current_revision_id"],
+      previous_revision_id: map["previous_revision_id"],
       last_health_check_at: map["last_health_check_at"]
     }
   end

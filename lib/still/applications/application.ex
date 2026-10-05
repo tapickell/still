@@ -17,6 +17,7 @@ defmodule Still.Applications.Application do
   alias Still.Hostname
 
   @types [:elixir_release, :static_site, :process]
+  @type t :: %__MODULE__{}
 
   schema "applications" do
     field :name, :string

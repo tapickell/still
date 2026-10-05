@@ -10,5 +10,9 @@ defmodule Still.Agent.ApplicationState do
             active_port: nil,
             current_version: nil,
             previous_version: nil,
+            current_release_id: nil,
+            previous_release_id: nil,
+            current_revision_id: nil,
+            previous_revision_id: nil,
             last_health_check_at: nil
 end

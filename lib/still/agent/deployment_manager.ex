@@ -19,10 +19,10 @@ defmodule Still.Agent.DeploymentManager do
   keep blue and green off the same Erlang node name while both are briefly
   live during a flip.
 
-  This module owns the state machine plumbing and the step body
-  implementations. Step bodies shell out to real tools (`curl`, `tar`,
-  `systemctl`) and call the Caddy admin API — they are proven end-to-end by
-  `@tag :integration` tests against real host tools, not unit tests.
+  This module owns the state machine plumbing and the step body implementations.
+  Artifact verification/extraction is delegated to ReleaseFiles and tested with
+  real local archives. Process steps use systemctl and Caddy and are additionally
+  exercised by the Linux integration suites.
 
   Tests inject a custom step provider via the `:step_provider` start option
   so the state machine can be exercised end-to-end without touching any of
@@ -38,8 +38,10 @@ defmodule Still.Agent.DeploymentManager do
   alias Still.Agent.DeployLogCollector
   alias Still.Agent.HealthMonitor
   alias Still.Agent.NodeConnector
+  alias Still.Agent.ReleaseFiles
   alias Still.Agent.StatePersistence
   alias Still.Agent.Systemd
+  alias Still.Artifact.Archive
   alias Still.Caddy.Config, as: CaddyConfig
   alias Still.Caddy.Tracing
   alias Still.CaddyBootstrap
@@ -65,10 +67,9 @@ defmodule Still.Agent.DeploymentManager do
 
   @doc """
   Rolls the application back to its previous version. The caller provides
-  a deploy-shaped spec with the application's current config (ports,
-  exec_command, health_check, etc.); the target `version` is read from the
-  agent's on-disk state — any `:version` field on the passed spec is
-  replaced.
+  a deploy-shaped spec with an exact release identity and the target revision's
+  process configuration. That identity must already exist and match its marker.
+  Legacy callers without an identity retain local previous-version behavior.
 
   Returns `{:ok, previous_version}` on success, `{:error, :no_previous_version}`
   if state is missing or there is nothing to roll back to, or
@@ -85,9 +86,9 @@ defmodule Still.Agent.DeploymentManager do
   taking the app down.
 
   The caller passes a deploy-shaped spec with the application's current config;
-  the target `version` is read from the agent's on-disk state, so each server
-  authoritatively re-boots exactly what it currently runs (any `:version` on the
-  passed spec is replaced).
+  immutable target must match the server's current release. A server on a
+  different release fails explicitly instead of acknowledging the wrong version.
+  Legacy callers without an identity retain local current-version behavior.
 
   Returns `{:ok, version}` on success, `{:error, :not_deployed}` when the
   application has no current version on this server, or
@@ -136,7 +137,7 @@ defmodule Still.Agent.DeploymentManager do
 
     case build_context(spec) do
       {:ok, context} ->
-        result = run_steps(steps, context)
+        result = execute_steps(steps, context)
         # Capture-then-stop: flush the journal before any failed slot is stopped.
         finish_log_capture()
 
@@ -157,7 +158,7 @@ defmodule Still.Agent.DeploymentManager do
     case build_rollback_context(spec) do
       {:ok, context} ->
         steps = state.rollback_step_provider.(spec.type)
-        result = run_steps(steps, context)
+        result = execute_steps(steps, context)
         finish_log_capture()
 
         case result do
@@ -177,7 +178,7 @@ defmodule Still.Agent.DeploymentManager do
     case build_restart_context(spec) do
       {:ok, context} ->
         steps = state.restart_step_provider.(spec.type)
-        result = run_steps(steps, context)
+        result = execute_steps(steps, context)
         # Capture-then-stop, same as deploy/rollback: a failed restart leaves a
         # crash-looping standby slot, so flush its journal before it's stopped.
         finish_log_capture()
@@ -226,6 +227,12 @@ defmodule Still.Agent.DeploymentManager do
           exception -> {:error, %{step: name, reason: Exception.message(exception)}}
         end
     end)
+  end
+
+  defp execute_steps(steps, context) do
+    run_steps(steps, context)
+  after
+    File.rm(context.tarball_path)
   end
 
   # A deploy/rollback that fails its health check has just started the target
@@ -325,6 +332,7 @@ defmodule Still.Agent.DeploymentManager do
   def default_rollback_steps_for(:static_site) do
     [
       {:pre_rollback, &pre_rollback_hook/1},
+      {:symlinking, &symlink/1},
       {:switching, &switch_caddy/1},
       {:cleanup, &cleanup/1},
       {:post_rollback, &post_rollback_hook/1}
@@ -368,6 +376,19 @@ defmodule Still.Agent.DeploymentManager do
   end
 
   defp build_context(spec) when is_map(spec) do
+    if safe_spec_paths?(spec) do
+      build_safe_context(spec)
+    else
+      {:error, :unsafe_release_identifier}
+    end
+  end
+
+  defp safe_spec_paths?(spec) do
+    Archive.safe_component?(spec.application) and Archive.safe_component?(spec.version) and
+      (is_nil(Map.get(spec, :release_id)) or match?({:ok, _}, Ecto.UUID.cast(spec.release_id)))
+  end
+
+  defp build_safe_context(spec) do
     applications_dir = Application.fetch_env!(:still, :applications_dir)
     app_dir = Path.join(applications_dir, spec.application)
 
@@ -378,18 +399,23 @@ defmodule Still.Agent.DeploymentManager do
 
     with {:ok, current_state} <- read_current_state(spec.application) do
       target_slot = next_slot(current_state)
+      # Only legacy restart/rollback contexts may read version-named directories.
+      release_id = Map.get(spec, :release_id) || Ecto.UUID.generate()
+      legacy? = Map.get(spec, :legacy_release?, false)
+      directory = if legacy?, do: spec.version, else: release_id
 
       {:ok,
        %{
          spec: spec,
+         release_id: if(legacy?, do: nil, else: release_id),
          deployment_id: Map.get(spec, :deployment_id),
          current_state: current_state,
          target_slot: target_slot,
          target_port: port_for_slot(spec, target_slot),
          previous_slot: previous_slot_for(current_state),
          app_dir: app_dir,
-         release_dir: Path.join([app_dir, "releases", spec.version]),
-         tarball_path: Path.join(app_dir, "#{spec.version}.tar.gz"),
+         release_dir: Path.join([app_dir, "releases", directory]),
+         tarball_path: Path.join(app_dir, ".download-#{Ecto.UUID.generate()}.tar.gz"),
          target_symlink: Path.join(app_dir, "current_#{target_slot}"),
          node_host: node_host()
        }}
@@ -416,24 +442,51 @@ defmodule Still.Agent.DeploymentManager do
     end
   end
 
+  defp build_rollback_context(%{release_id: id} = spec) when is_binary(id) do
+    build_exact_context(spec)
+  end
+
   defp build_rollback_context(spec) when is_map(spec) do
     case StatePersistence.read(spec.application) do
-      {:ok, %ApplicationState{previous_version: prev}} when not is_nil(prev) ->
+      {:ok, %ApplicationState{previous_version: prev} = persisted} when not is_nil(prev) ->
         # build_context/1 already returns {:ok, ctx} | {:error, _}.
-        build_context(Map.put(spec, :version, prev))
+        spec
+        |> Map.merge(%{
+          version: prev,
+          release_id: persisted.previous_release_id,
+          legacy_release?: is_nil(persisted.previous_release_id)
+        })
+        |> build_context()
 
       _ ->
         {:error, :no_previous_version}
     end
   end
 
+  defp build_restart_context(%{release_id: id} = spec) when is_binary(id) do
+    with {:ok, ctx} <- build_exact_context(spec),
+         %ApplicationState{current_release_id: ^id} <- ctx.current_state do
+      {:ok, Map.put(ctx, :restart?, true)}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :current_release_mismatch}
+    end
+  end
+
   defp build_restart_context(spec) when is_map(spec) do
     case StatePersistence.read(spec.application) do
-      {:ok, %ApplicationState{current_version: cur}} when not is_nil(cur) ->
+      {:ok, %ApplicationState{current_version: cur} = persisted} when not is_nil(cur) ->
         # Pin the version to what this server currently runs and tag the context
         # so cleanup preserves previous_version (the version isn't changing, so a
         # restart must not clobber the rollback target).
-        with {:ok, ctx} <- build_context(Map.put(spec, :version, cur)) do
+        spec =
+          Map.merge(spec, %{
+            version: cur,
+            release_id: persisted.current_release_id,
+            legacy_release?: is_nil(persisted.current_release_id)
+          })
+
+        with {:ok, ctx} <- build_context(spec) do
           {:ok, Map.put(ctx, :restart?, true)}
         end
 
@@ -452,6 +505,13 @@ defmodule Still.Agent.DeploymentManager do
 
       _ ->
         {:ok, :noop}
+    end
+  end
+
+  defp build_exact_context(spec) do
+    with {:ok, ctx} <- build_context(spec),
+         :ok <- ReleaseFiles.verify(ctx.release_dir, spec) do
+      {:ok, ctx}
     end
   end
 
@@ -579,14 +639,9 @@ defmodule Still.Agent.DeploymentManager do
   end
 
   defp unpack(ctx) when is_map(ctx) do
-    File.rm_rf!(ctx.release_dir)
-    File.mkdir_p!(ctx.release_dir)
-
-    args = ["-xzf", ctx.tarball_path, "-C", ctx.release_dir]
-
-    case System.cmd("tar", args, stderr_to_stdout: true) do
-      {_, 0} -> {:ok, ctx}
-      {output, code} -> {:error, "tar exit #{code}: #{String.trim(output)}"}
+    case ReleaseFiles.install(ctx.tarball_path, ctx.release_dir, ctx.spec) do
+      :ok -> {:ok, ctx}
+      {:error, _} = error -> error
     end
   end
 
@@ -706,6 +761,10 @@ defmodule Still.Agent.DeploymentManager do
       active_port: active_port_for(ctx),
       current_version: ctx.spec.version,
       previous_version: previous_version_for(ctx),
+      current_release_id: ctx.release_id,
+      previous_release_id: previous_release_id_for(ctx),
+      current_revision_id: Map.get(ctx.spec, :revision_id),
+      previous_revision_id: ctx.current_state && ctx.current_state.current_revision_id,
       last_health_check_at: nil
     }
 
@@ -763,6 +822,12 @@ defmodule Still.Agent.DeploymentManager do
     do: state.previous_version
 
   defp previous_version_for(ctx), do: previous_version(ctx.current_state)
+
+  defp previous_release_id_for(%{restart?: true, current_state: state}),
+    do: state.previous_release_id
+
+  defp previous_release_id_for(%{current_state: nil}), do: nil
+  defp previous_release_id_for(%{current_state: state}), do: state.current_release_id
 
   defp start(ctx) when is_map(ctx) do
     with :ok <- write_slot_env_file(ctx),

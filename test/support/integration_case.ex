@@ -73,6 +73,13 @@ defmodule Still.IntegrationCase do
     with :ok <- check_root(opts),
          :ok <- check_executables() do
       boot_test_environment(Keyword.get(opts, :otlp, false))
+    else
+      {:skip, reason} = skip ->
+        if System.get_env("STILL_STRICT_INTEGRATION") == "1" do
+          raise "Integration prerequisites failed: #{reason}"
+        else
+          skip
+        end
     end
   end
 

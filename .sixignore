@@ -11,8 +11,8 @@ lib/still/agent/console_manager.ex do_spawn_console 0f7a7b4d
 lib/still/agent/deploy_log_collector.ex 7cd42e86
 lib/still/agent/deploy_log_collector.ex ae25f31e
 lib/still/agent/deploy_log_collector.ex handle_info 98dadb7a
-lib/still/agent/deployment_manager.ex 16cc23b7
-lib/still/agent/deployment_manager.ex 4058b043
+lib/still/agent/deployment_manager.ex 68fcc049
+lib/still/agent/deployment_manager.ex 8597191b
 lib/still/agent/deployment_manager.ex fc957ca4
 lib/still/agent/deployment_manager.ex read_current_state 15a90428
 lib/still/agent/node_connector.ex init 650143be
@@ -20,13 +20,12 @@ lib/still/agent/node_metrics.ex 96e7c006
 lib/still/agent/systemd.ex 294298ec
 lib/still/agent/systemd.ex d9073d89
 lib/still/agent_connection_manager.ex init 650143be
-lib/still/artifact_store.ex file_mtime 77e8de8c
 lib/still/caddy_metrics_scraper.ex 1f3b38b5
 lib/still/dev/maple_demo.ex c8d33e7d
 lib/still/dev/standalone.ex ed8fd291
-lib/still/orchestrator.ex b451d0ad
-lib/still/orchestrator.ex execute_rolling_deploy 01165896
+lib/still/orchestrator.ex 8dd1e3d5
+lib/still/orchestrator.ex execute_rolling_deploy 5d674836
 lib/still/release.ex ffdf8da5
-test/support/integration_case.ex ba10ede1
-test/support/integration_fixtures.ex 7e5e5325
+test/support/integration_case.ex 60c978eb
+test/support/integration_fixtures.ex 5a0fc51b
 test/support/recording_server.ex 0fcb583c
