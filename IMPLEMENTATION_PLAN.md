@@ -19,6 +19,24 @@ switch recovery, concurrent routing mutations, and fleet-wide convergence still
 require Phases 2–3. Real Linux/Caddy/systemd qualification remains a release gate;
 passing unit tests alone does not establish that gate.
 
+### Local Linux validation environment
+
+The repeatable lab is available via `bash scripts/test-linux.sh all`; see
+[infra/test/README.md](infra/test/README.md). It builds the current worktree in
+isolation and exercises real Caddy, systemd, release binaries, and distributed
+agent peers. Result summaries and diagnostic logs are retained under
+`tmp/linux-tests/`.
+
+On 2026-10-04, native Linux ARM64 validation passed 1,622 unit tests, 29 non-root
+integration tests, and 20 root/systemd tests, with zero failures or skips in each
+selected suite. Nine runner tests and ShellCheck also passed. Native release
+fixtures were built from verified upstream source using the pinned image
+toolchain; this is not qualification of the upstream prebuilt AMD64 artifacts.
+
+The lab is not a substitute for future separate-host failure and capacity tests.
+Its independent agent BEAMs currently share one container's kernel/network
+namespace; autoscaling and network-partition guarantees remain unimplemented.
+
 ## 1. Objective
 
 Strengthen Still's deployment coordination and recovery using the most applicable

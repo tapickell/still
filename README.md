@@ -617,6 +617,23 @@ Still.Dev.Standalone.reset()       # remove the seeded apps, server, and dev adm
 
 ## Running the tests
 
+### Repeatable local Linux environment
+
+With a Linux Docker daemon running, no host Caddy installation is needed:
+
+```sh
+bash scripts/test-linux.sh all
+```
+
+This builds the current worktree for the daemon's native architecture and runs
+unit tests, real Caddy/multi-agent tests, and real systemd lifecycle tests. **The
+root suite uses a privileged disposable container: use a trusted development
+daemon, never production.** No host directories or Docker socket are mounted.
+Logs and result summaries are retained under `tmp/linux-tests/`.
+
+See [the local Linux test guide](infra/test/README.md) for focused runs, image and
+fixture pins, isolation limits, and keeping a failed container for inspection.
+
 ### Unit tests
 
 ```sh

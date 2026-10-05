@@ -6,7 +6,11 @@ Ecto.Adapters.SQL.Sandbox.mode(Still.Repo, :manual)
 # exits, those ports close with a "Erlang has closed" line to stderr.
 # Stopping the app cleanly at suite-end closes the ports first and keeps
 # the test output free of the noise.
-ExUnit.after_suite(fn _result ->
+ExUnit.after_suite(fn result ->
+  if report = System.get_env("STILL_TEST_REPORT") do
+    File.write!(report, Jason.encode!(result))
+  end
+
   Application.stop(:os_mon)
 end)
 
