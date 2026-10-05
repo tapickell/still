@@ -15,6 +15,7 @@ defmodule Still.Applications.Hook do
     field :event, Ecto.Enum, values: @events
     field :script, :string
     field :timeout_ms, :integer, default: 60_000
+    field :scope, Ecto.Enum, values: [:per_replica, :per_rollout], default: :per_replica
 
     belongs_to :application, Application
 
@@ -31,7 +32,7 @@ defmodule Still.Applications.Hook do
   """
   def creation_changeset(%__MODULE__{} = hook, attrs) when is_map(attrs) do
     hook
-    |> cast(attrs, [:event, :script, :timeout_ms])
+    |> cast(attrs, [:event, :script, :timeout_ms, :scope])
     |> validate_required([:event, :script, :timeout_ms])
     |> common_validations()
     |> assoc_constraint(:application)
@@ -44,13 +45,14 @@ defmodule Still.Applications.Hook do
   """
   def update_changeset(%__MODULE__{} = hook, attrs) when is_map(attrs) do
     hook
-    |> cast(attrs, [:script, :timeout_ms])
+    |> cast(attrs, [:script, :timeout_ms, :scope])
     |> validate_required([:script, :timeout_ms])
     |> common_validations()
   end
 
   defp common_validations(changeset) do
     changeset
+    |> validate_required([:scope])
     |> validate_length(:script, min: 1, max: 100_000)
     |> validate_number(:timeout_ms, greater_than: 0, less_than_or_equal_to: 3_600_000)
   end

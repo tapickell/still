@@ -73,9 +73,7 @@ defmodule Still.CaddyBootstrap do
   is unreachable or rejects the config.
   """
   def reconcile(opts) when is_list(opts) do
-    with {:ok, config} <- CaddyManager.get_config() do
-      CaddyManager.load_config(rebuild(config, opts))
-    end
+    CaddyManager.update(fn config -> {:ok, rebuild(config, opts)} end)
   end
 
   @doc """

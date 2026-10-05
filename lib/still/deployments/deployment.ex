@@ -26,8 +26,9 @@ defmodule Still.Deployments.Deployment do
 
     field :operation_kind, Ecto.Enum,
       values: [:deploy, :rollback, :restart],
-      virtual: true,
       default: :deploy
+
+    field :durable_operations, :boolean, default: false
 
     belongs_to :release, Still.Releases.Release
     belongs_to :revision, Still.Releases.Revision
@@ -36,6 +37,8 @@ defmodule Still.Deployments.Deployment do
 
     has_many :steps, DeploymentStep,
       preload_order: [asc_nulls_last: :started_at, asc: :inserted_at, asc: :id]
+
+    has_many :operations, Still.Deployments.Operation, preload_order: [asc: :position]
 
     timestamps()
   end

@@ -8,6 +8,7 @@ defmodule StillWeb.Schemas.UpdateHookRequest do
     type: :object,
     properties: %{
       script: %OpenApiSpex.Schema{type: :string, minLength: 1, maxLength: 100_000},
+      scope: %OpenApiSpex.Schema{type: :string, enum: ["per_replica", "per_rollout"]},
       timeout_ms: %OpenApiSpex.Schema{type: :integer, minimum: 1, maximum: 3_600_000}
     }
   })

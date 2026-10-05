@@ -103,8 +103,8 @@ defmodule StillWeb.ApplicationController do
     if Applications.application_has_assignments?(application.id) do
       {:error, :application_has_assignments}
     else
-      {:ok, _} = Applications.delete_application(Actor.from_conn(conn), application)
-      send_resp(conn, :no_content, "")
+      with {:ok, _} <- Applications.delete_application(Actor.from_conn(conn), application),
+           do: send_resp(conn, :no_content, "")
     end
   end
 end

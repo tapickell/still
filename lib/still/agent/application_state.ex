@@ -14,5 +14,7 @@ defmodule Still.Agent.ApplicationState do
             previous_release_id: nil,
             current_revision_id: nil,
             previous_revision_id: nil,
+            operation_id: nil,
+            generation: nil,
             last_health_check_at: nil
 end

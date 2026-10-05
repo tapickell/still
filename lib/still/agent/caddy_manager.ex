@@ -35,6 +35,26 @@ defmodule Still.Agent.CaddyManager do
   validation fails or the admin API is unreachable.
   """
   def load_config(config) when is_map(config) do
+    synchronize(fn -> do_load_config(config) end)
+  end
+
+  @doc "Serializes a complete read/modify/write transaction for this node's Caddy endpoint."
+  @spec synchronize((-> result)) :: result when result: var
+  def synchronize(fun) when is_function(fun, 0) do
+    :global.trans({{__MODULE__, caddy_admin_url()}, self()}, fun, [node()])
+  end
+
+  @doc "Atomically transforms the latest config relative to every other Still writer on this node."
+  @spec update((map() -> {:ok, map()} | {:error, term()})) :: :ok | {:error, term()}
+  def update(transform) when is_function(transform, 1) do
+    synchronize(fn ->
+      with {:ok, config} <- get_config(),
+           {:ok, updated} <- transform.(config),
+           do: do_load_config(updated)
+    end)
+  end
+
+  defp do_load_config(config) do
     case Req.post(req(), url: "/load", json: config) do
       {:ok, %Req.Response{status: status}} when status in 200..299 ->
         :ok

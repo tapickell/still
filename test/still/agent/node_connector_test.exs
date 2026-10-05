@@ -6,6 +6,28 @@ defmodule Still.Agent.NodeConnectorTest do
   alias Still.Agent.StatePersistence
   alias Still.AgentConnectionManager
 
+  test "forwards operation progress with the agent identity and ignores unidentified reports" do
+    owner = self()
+
+    receiver =
+      spawn_link(fn ->
+        receive do
+          {:"$gen_cast", message} -> send(owner, {:forwarded, message})
+        end
+      end)
+
+    Process.register(receiver, Still.Orchestrator)
+    state = %{server_id: Ecto.UUID.generate(), controller: node()}
+    report = %{id: Ecto.UUID.generate(), generation: 1, sequence: 1, status: :accepted}
+    assert {:noreply, ^state} = NodeConnector.handle_cast({:report_operation, report}, state)
+    server_id = state.server_id
+    assert_receive {:forwarded, {:operation_report, ^server_id, ^report}}
+    unidentified = %{state | server_id: nil}
+
+    assert {:noreply, ^unidentified} =
+             NodeConnector.handle_cast({:report_operation, report}, unidentified)
+  end
+
   describe "init/1" do
     test "returns the initial state and queues a :try_connect message" do
       stub = fn _ -> false end

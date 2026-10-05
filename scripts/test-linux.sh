@@ -3,11 +3,11 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'Usage: bash scripts/test-linux.sh [build|scripts|unit|integration|root|all] [mix test arguments...]' \
+    'Usage: bash scripts/test-linux.sh [build|scripts|unit|integration|root|coverage|all] [mix test arguments...]' \
     '' \
     'Default: all (runner checks, unit, non-root integration, then systemd/root integration).' \
     'Each invocation builds the current worktree into an isolated Linux image.' \
-    'root/all use a privileged container; use only a trusted disposable Docker daemon.' \
+    'root/coverage/all use a privileged container; use only a trusted disposable Docker daemon.' \
     'No host mounts, Docker socket, host networking, or published ports are used.' \
     '' \
     'STILL_TEST_PLATFORM             Defaults to the Docker daemon native architecture.' \
@@ -20,7 +20,7 @@ suite=${1:-all}
 if [[ $# -gt 0 ]]; then shift; fi
 case "$suite" in
   -h|--help|help) usage; exit 0 ;;
-  build|scripts|unit|integration|root|all) ;;
+  build|scripts|unit|integration|root|coverage|all) ;;
   *) usage >&2; exit 2 ;;
 esac
 if [[ ( $suite == all || $suite == build || $suite == scripts ) && $# -gt 0 ]]; then
@@ -38,7 +38,7 @@ case "$architecture" in
 esac
 platform=${STILL_TEST_PLATFORM:-$native_platform}
 image=${STILL_TEST_IMAGE:-still-test:local}
-if [[ $suite == root || $suite == all ]] && [[ $platform != "$native_platform" ]]; then
+if [[ $suite == root || $suite == coverage || $suite == all ]] && [[ $platform != "$native_platform" ]]; then
   printf 'root/all require native systemd; use %s on this daemon.\n' "$native_platform" >&2
   exit 2
 fi
@@ -59,9 +59,10 @@ cleanup() {
     docker inspect "$container_id" >"$results/container.json" 2>&1 || true
     docker exec "$container_id" journalctl --no-pager >"$results/journal.log" 2>&1 || true
     docker exec "$container_id" systemctl --failed --no-pager >"$results/failed-units.log" 2>&1 || true
-    for selected in unit integration root; do
+    for selected in unit integration root coverage; do
       docker cp "$container_id:/workspace/.test-results/${selected}.json" "$results/${selected}.json" 2>/dev/null || true
     done
+    docker cp "$container_id:/workspace/.six/coverage.md" "$results/coverage.md" 2>/dev/null || true
     docker cp "$container_id:/opt/still-fixtures/BUILD_INFO" "$results/fixture-build.txt" 2>/dev/null || true
     docker cp "$container_id:/opt/still-fixtures/SHA256SUMS" "$results/fixture-checksums.txt" 2>/dev/null || true
     if [[ ${STILL_TEST_KEEP:-0} == 1 ]]; then
@@ -94,7 +95,7 @@ git rev-parse HEAD >"$results/revision.txt"
 git status --short >>"$results/revision.txt"
 [[ $suite != build ]] || exit 0
 
-if [[ $suite == root || $suite == all ]]; then
+if [[ $suite == root || $suite == coverage || $suite == all ]]; then
   printf 'Starting privileged systemd test container (no host mounts): %s\n' "$name"
   container_id=$(docker create --name "$name" --platform "$platform" \
     --label still.test-run=true --privileged --cgroupns=private \
@@ -121,7 +122,7 @@ fi
 run_suite() {
   local selected=$1 user=tester home=/home/tester status=0
   shift
-  if [[ $selected == root ]]; then user=root; home=/root; fi
+  if [[ $selected == root || $selected == coverage ]]; then user=root; home=/root; fi
   docker exec --user "$user" --env "HOME=$home" --env "USER=$user" "$container_id" /usr/local/bin/still-test-suite "$selected" "$@" \
     2>&1 | tee "$results/$selected.log" || status=$?
   if [[ $status == 0 && $selected != scripts ]]; then

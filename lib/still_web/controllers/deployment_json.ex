@@ -66,7 +66,19 @@ defmodule StillWeb.DeploymentJSON do
 
   @doc "Show shape: base + `steps`."
   def deployment_with_steps(%Deployment{steps: steps} = deployment) when is_list(steps) do
-    deployment |> deployment() |> Map.put(:steps, Enum.map(steps, &step/1))
+    operations =
+      if is_list(deployment.operations),
+        do:
+          Enum.map(
+            deployment.operations,
+            &Map.take(&1, [:id, :server_id, :generation, :status, :sequence, :phase, :error])
+          ),
+        else: []
+
+    deployment
+    |> deployment()
+    |> Map.put(:steps, Enum.map(steps, &step/1))
+    |> Map.put(:operations, operations)
   end
 
   @doc "Single step row."

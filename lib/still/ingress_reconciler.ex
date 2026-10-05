@@ -131,15 +131,17 @@ defmodule Still.IngressReconciler do
     desired_ingress_routes = Ingress.build_routes(entries)
 
     result =
-      with {:ok, config} <- state.caddy_module.get_config(),
-           new_config = merge_ingress_routes(config, desired_ingress_routes),
-           :ok <- state.caddy_module.load_config(new_config) do
-        :ok
-      else
-        {:error, reason} = error ->
-          Logger.warning("IngressReconciler: Caddy reconcile failed: #{inspect(reason)}")
-          error
-      end
+      CaddyManager.synchronize(fn ->
+        with {:ok, config} <- state.caddy_module.get_config(),
+             new_config = merge_ingress_routes(config, desired_ingress_routes),
+             :ok <- state.caddy_module.load_config(new_config) do
+          :ok
+        else
+          {:error, reason} = error ->
+            Logger.warning("IngressReconciler: Caddy reconcile failed: #{inspect(reason)}")
+            error
+        end
+      end)
 
     if state.notifier, do: send(state.notifier, {:ingress_reconciled, result})
     result

@@ -118,8 +118,8 @@ defmodule StillWeb.ServerController do
     if Applications.server_has_assignments?(server.id) do
       {:error, :server_has_assignments}
     else
-      {:ok, _} = Fleet.delete_server(Actor.from_conn(conn), server)
-      send_resp(conn, :no_content, "")
+      with {:ok, _} <- Fleet.delete_server(Actor.from_conn(conn), server),
+           do: send_resp(conn, :no_content, "")
     end
   end
 end

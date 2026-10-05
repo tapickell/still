@@ -12,6 +12,11 @@ defmodule StillWeb.Schemas.CreateHookRequest do
         enum: ["pre_deploy", "release", "post_deploy", "pre_rollback", "post_rollback"]
       },
       script: %OpenApiSpex.Schema{type: :string, minLength: 1, maxLength: 100_000},
+      scope: %OpenApiSpex.Schema{
+        type: :string,
+        enum: ["per_replica", "per_rollout"],
+        default: "per_replica"
+      },
       timeout_ms: %OpenApiSpex.Schema{type: :integer, minimum: 1, maximum: 3_600_000}
     },
     required: [:event, :script, :timeout_ms]

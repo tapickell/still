@@ -80,6 +80,12 @@ defmodule StillWeb.Schemas.Deployment do
         nullable: true,
         items: DeploymentStep,
         description: "Per-server step rows, included on the show response only."
+      },
+      operations: %OpenApiSpex.Schema{
+        type: :array,
+        items: %OpenApiSpex.Schema{type: :object},
+        description:
+          "Durable per-host progress (id, server_id, generation, status, sequence, phase, error); never private commands."
       }
     },
     required: [:id, :application_id, :version, :artifact_url, :status, :initiated_by]

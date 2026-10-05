@@ -9,6 +9,7 @@ defmodule Still.Agent.StatePersistence do
   """
 
   alias Still.Agent.ApplicationState
+  alias Still.Agent.OperationJournal
 
   @doc """
   Reads the persisted state for the given application.
@@ -37,9 +38,9 @@ defmodule Still.Agent.StatePersistence do
 
     File.mkdir_p!(Path.dirname(path))
 
-    case File.write(tmp_path, Jason.encode!(state)) do
-      :ok -> File.rename(tmp_path, path)
-      error -> error
+    with :ok <- File.write(tmp_path, Jason.encode!(state), [:sync]),
+         :ok <- File.rename(tmp_path, path) do
+      OperationJournal.sync_directory(Path.dirname(path))
     end
   end
 
@@ -100,6 +101,8 @@ defmodule Still.Agent.StatePersistence do
       previous_release_id: map["previous_release_id"],
       current_revision_id: map["current_revision_id"],
       previous_revision_id: map["previous_revision_id"],
+      operation_id: map["operation_id"],
+      generation: map["generation"],
       last_health_check_at: map["last_health_check_at"]
     }
   end

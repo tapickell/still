@@ -70,6 +70,12 @@ defmodule Still.Fleet do
   Deletes a server.
   """
   def delete_server(%Actor{} = actor, %Server{} = server) do
+    if Still.Operations.references?(:server_id, server.id),
+      do: {:error, :operation_history_retained},
+      else: delete_server_record(actor, server)
+  end
+
+  defp delete_server_record(actor, server) do
     before_snapshot = Audit.snapshot(server)
 
     Multi.new()

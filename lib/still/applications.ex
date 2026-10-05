@@ -103,6 +103,14 @@ defmodule Still.Applications do
   Deletes an application.
   """
   def delete_application(%Actor{} = actor, %Application{} = application) do
+    with_assignment_lock(application.id, fn ->
+      with :ok <- ensure_idle(application.id),
+           :ok <- ensure_no_operations(application.id),
+           do: delete_application_record(actor, application)
+    end)
+  end
+
+  defp delete_application_record(actor, application) do
     before_snapshot = Audit.snapshot(application)
 
     Multi.new()
@@ -140,7 +148,18 @@ defmodule Still.Applications do
         attrs \\ %{}
       )
       when is_map(attrs) do
-    with {:ok, attrs_with_ports} <- ensure_ports(server, normalize_port_keys(attrs)) do
+    with_assignment_lock(application.id, fn ->
+      :global.trans(
+        {{__MODULE__, :ports, server.id}, self()},
+        fn -> assign_server_record(actor, application, server, attrs) end,
+        [node()]
+      )
+    end)
+  end
+
+  defp assign_server_record(actor, application, server, attrs) do
+    with :ok <- ensure_idle(application.id),
+         {:ok, attrs_with_ports} <- ensure_ports(server, normalize_port_keys(attrs)) do
       Multi.new()
       |> Multi.insert(:assignment, assignment_changeset(application, server, attrs_with_ports))
       |> Audit.multi(actor, fn %{assignment: assignment} ->
@@ -181,6 +200,14 @@ defmodule Still.Applications do
   Removes a server assignment from an application.
   """
   def unassign_server(%Actor{} = actor, %ApplicationServer{} = assignment) do
+    with_assignment_lock(assignment.application_id, fn ->
+      with :ok <- ensure_idle(assignment.application_id),
+           :ok <- ensure_no_operations(assignment.application_id),
+           do: unassign_server_record(actor, assignment)
+    end)
+  end
+
+  defp unassign_server_record(actor, assignment) do
     assignment = Repo.preload(assignment, [:application, :server])
     before_snapshot = Audit.snapshot(assignment)
 
@@ -202,6 +229,30 @@ defmodule Still.Applications do
     end)
     |> Repo.transaction()
     |> finalize(:assignment, fleet_changing: true)
+  end
+
+  @doc "Serializes assignment changes with deployment admission on the single active controller."
+  def with_assignment_lock(application_id, fun)
+      when is_binary(application_id) and is_function(fun, 0) do
+    :global.trans({{__MODULE__, :assignments, application_id}, self()}, fun, [node()])
+  end
+
+  defp ensure_idle(application_id) do
+    busy =
+      Repo.exists?(
+        from d in Still.Deployments.Deployment,
+          where:
+            d.application_id == ^application_id and
+              d.durable_operations and d.status in [:pending, :in_progress]
+      )
+
+    if busy, do: {:error, :deployment_in_progress}, else: :ok
+  end
+
+  defp ensure_no_operations(application_id) do
+    if Still.Operations.references?(:application_id, application_id),
+      do: {:error, :operation_history_retained},
+      else: :ok
   end
 
   # Unwraps the multi result, emits the audit event live (after commit),

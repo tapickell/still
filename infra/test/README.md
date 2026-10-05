@@ -12,6 +12,7 @@ bash scripts/test-linux.sh scripts
 bash scripts/test-linux.sh unit
 bash scripts/test-linux.sh integration
 bash scripts/test-linux.sh root
+bash scripts/test-linux.sh coverage
 bash scripts/test-linux.sh integration test/integration/immutable_release_test.exs
 bash scripts/test-linux.sh root test/integration/elixir_release_restart_test.exs
 
@@ -46,7 +47,7 @@ by this environment.
 
 ## Safety boundary
 
-**`root` and `all` start a privileged container to run systemd.** Use only trusted
+**`root`, `coverage`, and `all` start a privileged container to run systemd.** Use only trusted
 repository code, fixture sources, and a disposable development Docker daemon.
 Privileged containers are not a security sandbox against hostile code. On Docker
 Desktop the daemon runs in its Linux VM; on a Linux host the privilege risk applies

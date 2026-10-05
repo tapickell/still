@@ -15,7 +15,9 @@ defmodule StillWeb.ApplicationLiveTest do
   alias Still.Deployments
   alias Still.Events
   alias Still.MetricsCollector
+  alias Still.Operations
   alias Still.Orchestrator
+  alias Still.Repo
 
   setup do
     start_supervised!(AgentConnectionManager)
@@ -111,6 +113,40 @@ defmodule StillWeb.ApplicationLiveTest do
     setup %{conn: conn} do
       admin = AccountsFixtures.user_fixture(%{role: :admin})
       %{conn: log_in_user(conn, admin)}
+    end
+
+    test "durable history blocks unassignment and deletion without crashing the view", %{
+      conn: conn
+    } do
+      app = application_fixture(%{name: "guarded"})
+      server = server_fixture(%{name: "guarded-server"})
+      {:ok, assignment} = Applications.assign_server(Actor.system(), app, server)
+      deployment = deployment_fixture(app)
+      step = Deployments.get_step_for_server!(deployment.id, server.id)
+
+      Operations.ensure(deployment, step, %{
+        application: app.name,
+        type: app.type,
+        version: deployment.version,
+        release_id: Ecto.UUID.generate()
+      })
+
+      {:ok, lv, _} = live(conn, ~p"/applications/guarded")
+      lv |> element("#fleet button", "Unassign") |> render_click()
+
+      assert lv |> element("#unassign-server button", "Unassign") |> render_click() =~
+               "blocked by durable"
+
+      lv |> element("#unassign-server button", "Cancel") |> render_click()
+      # Simulate an out-of-band/legacy assignment removal: the remaining history
+      # must still protect deletion, rather than raising a foreign-key exception.
+      Repo.delete!(assignment)
+      Events.fleet_changed()
+      render(lv)
+      lv |> element("button", "Delete") |> render_click()
+
+      assert lv |> element("#delete-app button", "Delete") |> render_click() =~
+               "coordinated decommission"
     end
 
     test "shows the audit history and expands an event", %{conn: conn} do

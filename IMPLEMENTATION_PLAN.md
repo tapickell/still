@@ -6,6 +6,30 @@
 
 **Related document:** [PROJECT_REVIEW_AND_AUTOSCALING.md](PROJECT_REVIEW_AND_AUTOSCALING.md)
 
+### Phase 2 implementation notes
+
+The durable-operation protocol, synced private agent journals, per-application
+workers, controller restart recovery, conservative agent recovery, Caddy write
+serialization, explicit hook scopes, and public operation progress are implemented.
+See [DURABLE_OPERATIONS.md](DURABLE_OPERATIONS.md) for guarantees, recovery commands,
+upgrade requirements, and the new safeguards around retained history.
+
+The full native Linux coverage gate includes unit, distributed/Caddy, and real
+systemd recovery tests. Use `bash scripts/test-linux.sh coverage`; the 100% minimum
+is unchanged, and no coverage exclusions were added for the new operation engine.
+Unit-only coverage remains a diagnostic subset, not the full-path acceptance gate.
+
+Validated on 2026-10-05: 1,713 tests passed in the full native Linux coverage run,
+with zero failures/skips and 100% coverage in the configured scope. The nine
+runner tests, strict Credo, warnings-as-errors compilation, and formatting checks
+also passed. Validation includes cold peer restart, lost acceptance replies,
+controller restart, interrupted hooks, real process-start/switch recovery, and
+concurrent Caddy configuration updates.
+
+Automatic cancellation, coordinated decommission, independently versioned live
+routing policy, controller HA, and automatic fleet convergence are not implemented
+by Phase 2. Unknown work remains locked rather than claiming those guarantees.
+
 ### Phase 1 implementation notes
 
 Phase 1 code now includes release/revision schemas, content-addressed verified
@@ -584,11 +608,12 @@ mix compile --warnings-as-errors
 mix format --check-formatted
 mix credo --strict
 mix test
-mix six --minimum-coverage 100
 mix test --only integration
 ```
 
-Run the root integration suite in its dedicated disposable Linux job.
+Run the root integration suite in its dedicated disposable Linux job. The full
+coverage gate is `bash scripts/test-linux.sh coverage`, including both integration
+categories in a privileged disposable Linux container with systemd.
 
 Add:
 

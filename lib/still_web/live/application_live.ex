@@ -525,13 +525,21 @@ defmodule StillWeb.ApplicationLive do
       {:noreply,
        assign(socket, :delete_error, "Unassign every server before deleting this application.")}
     else
-      {:ok, _} =
-        Applications.delete_application(Actor.from_scope(socket.assigns.current_scope), app)
+      case Applications.delete_application(Actor.from_scope(socket.assigns.current_scope), app) do
+        {:ok, _} ->
+          {:noreply,
+           socket
+           |> put_flash(:info, "#{app.name} deleted")
+           |> push_navigate(to: ~p"/applications")}
 
-      {:noreply,
-       socket
-       |> put_flash(:info, "#{app.name} deleted")
-       |> push_navigate(to: ~p"/applications")}
+        {:error, _} ->
+          {:noreply,
+           assign(
+             socket,
+             :delete_error,
+             "Durable operation history requires coordinated decommission."
+           )}
+      end
     end
   end
 
@@ -552,13 +560,23 @@ defmodule StillWeb.ApplicationLive do
   defp unassign_server(socket) do
     target = socket.assigns.unassign_target
     assignment = Applications.get_application_server!(application_scope(socket), target.id)
-    {:ok, _} = Applications.unassign_server(current_actor(socket), assignment)
 
-    {:noreply,
-     socket
-     |> assign(:unassign_target, nil)
-     |> load()
-     |> put_flash(:info, "#{target.name} unassigned")}
+    case Applications.unassign_server(current_actor(socket), assignment) do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> assign(:unassign_target, nil)
+         |> load()
+         |> put_flash(:info, "#{target.name} unassigned")}
+
+      {:error, _} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Unassignment is blocked by durable deployment state; coordinated decommission is required."
+         )}
+    end
   end
 
   defp save_config(socket, params) do

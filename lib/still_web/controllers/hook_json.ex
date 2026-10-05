@@ -21,6 +21,7 @@ defmodule StillWeb.HookJSON do
       id: hook.id,
       application_id: hook.application_id,
       event: hook.event,
+      scope: hook.scope,
       script: hook.script,
       timeout_ms: hook.timeout_ms,
       inserted_at: hook.inserted_at,

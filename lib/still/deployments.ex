@@ -43,6 +43,10 @@ defmodule Still.Deployments do
       |> Ecto.Changeset.put_change(:release_id, Map.get(attrs, :release_id))
       |> Ecto.Changeset.put_change(:revision_id, Map.get(attrs, :revision_id))
       |> Ecto.Changeset.put_change(:operation_kind, Map.get(attrs, :operation_kind, :deploy))
+      |> Ecto.Changeset.put_change(
+        :durable_operations,
+        Map.get(attrs, :durable_operations, false)
+      )
 
     multi =
       Ecto.Multi.new()
@@ -203,7 +207,7 @@ defmodule Still.Deployments do
   def get_deployment!(id) when is_binary(id) do
     Deployment
     |> Repo.get!(id)
-    |> Repo.preload([:steps, :application])
+    |> Repo.preload([:steps, :application, :operations])
   end
 
   @doc """
@@ -213,7 +217,7 @@ defmodule Still.Deployments do
   def get_deployment(id) when is_binary(id) do
     case Repo.get(Deployment, id) do
       nil -> nil
-      deployment -> Repo.preload(deployment, [:steps, :application])
+      deployment -> Repo.preload(deployment, [:steps, :application, :operations])
     end
   end
 
@@ -308,7 +312,10 @@ defmodule Still.Deployments do
   """
   def start_deployment!(%Deployment{} = deployment) do
     deployment
-    |> Ecto.Changeset.change(%{status: :in_progress, started_at: DateTime.utc_now()})
+    |> Ecto.Changeset.change(%{
+      status: :in_progress,
+      started_at: deployment.started_at || DateTime.utc_now()
+    })
     |> Repo.update!()
   end
 
@@ -317,7 +324,7 @@ defmodule Still.Deployments do
   """
   def complete_deployment!(%Deployment{} = deployment) do
     deployment
-    |> Ecto.Changeset.change(%{status: :completed, completed_at: DateTime.utc_now()})
+    |> Ecto.Changeset.change(%{status: :completed, error: nil, completed_at: DateTime.utc_now()})
     |> Repo.update!()
   end
 
@@ -348,7 +355,11 @@ defmodule Still.Deployments do
     now = DateTime.utc_now()
 
     orphaned_ids =
-      Repo.all(from d in Deployment, where: d.status == :in_progress, select: d.id)
+      Repo.all(
+        from d in Deployment,
+          where: d.status == :in_progress and not d.durable_operations,
+          select: d.id
+      )
 
     case orphaned_ids do
       [] ->
@@ -379,7 +390,7 @@ defmodule Still.Deployments do
   """
   def start_deployment_step!(%DeploymentStep{} = step) do
     step
-    |> Ecto.Changeset.change(%{started_at: DateTime.utc_now()})
+    |> Ecto.Changeset.change(%{started_at: step.started_at || DateTime.utc_now()})
     |> Repo.update!()
   end
 

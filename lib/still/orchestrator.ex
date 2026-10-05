@@ -4,8 +4,10 @@ defmodule Still.Orchestrator do
 
   Accepts deployment requests, validates preconditions (servers assigned, enough
   agents connected), creates the database records, and spawns a background task
-  that sends `{:deploy, spec}` to each agent server-by-server, halting on the
-  first failure.
+  that submits persisted operations server-by-server and observes their progress.
+  Known failure halts the rollout; transport uncertainty preserves the lock and
+  pending intent. Private task supervision ties observers to this coordinator's
+  lifetime, while agent work is independent of a controller restart.
 
   Only one deployment per application may be in progress at a time — a second
   request for the same application returns `{:error, :deployment_in_progress}`.
@@ -18,23 +20,26 @@ defmodule Still.Orchestrator do
 
   use GenServer
 
+  import Ecto.Query, only: [from: 2]
+
   require Logger
 
   alias Still.AgentConnectionManager
   alias Still.Applications
   alias Still.Applications.Application
+  alias Still.Applications.ApplicationServer
   alias Still.ArtifactStore
   alias Still.Audit
   alias Still.Audit.Actor
   alias Still.Deployments
   alias Still.Deployments.FailureReason
+  alias Still.Operations
   alias Still.Protocol.DeployRequest
   alias Still.Releases
+  alias Still.Repo
 
-  # Fire-and-forget deploy/route tasks run under this supervisor (started in
-  # Still.Application.common_children) so a crashing task can't take the
-  # Orchestrator — or sibling deploys that used to share its link — down.
-  @task_supervisor Still.Orchestrator.TaskSupervisor
+  # Each coordinator owns its task supervisor. Replacing the coordinator also
+  # replaces its observers, rather than leaving duplicate polling tasks alive.
 
   @doc """
   Starts the Orchestrator GenServer.
@@ -131,9 +136,26 @@ defmodule Still.Orchestrator do
       recover_orphans()
     end
 
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+
+    durable =
+      Keyword.get(
+        opts,
+        :durable_operations,
+        not Enum.any?(
+          [:agent_caller, :rollback_agent_caller, :restart_agent_caller],
+          &Keyword.has_key?(opts, &1)
+        )
+      )
+
+    if durable, do: send(self(), :resume_pending)
+
     {:ok,
      %{
        in_progress: MapSet.new(),
+       tasks: %{},
+       task_supervisor: task_supervisor,
+       durable: durable,
        agent_caller: Keyword.get(opts, :agent_caller, &default_agent_caller/2),
        rollback_agent_caller:
          Keyword.get(opts, :rollback_agent_caller, &default_rollback_caller/2),
@@ -160,21 +182,27 @@ defmodule Still.Orchestrator do
   @impl true
   def handle_call({:trigger_deployment, actor, application, attrs}, _from, state)
       when is_map(state) do
-    if MapSet.member?(state.in_progress, application.name) do
+    attrs = Map.put(attrs, :durable_operations, state.durable)
+
+    if application_busy?(state, application) do
       {:reply, {:error, :deployment_in_progress}, state}
     else
       case validate_and_create(actor, application, attrs) do
         {:ok, deployment, servers} ->
           state = %{state | in_progress: MapSet.put(state.in_progress, application.name)}
 
-          spawn_rolling_task(
-            deployment,
-            application,
-            servers,
-            state.agent_caller,
-            state.artifact_stager,
-            state.notifier
-          )
+          ref =
+            spawn_rolling_task(
+              deployment,
+              application,
+              servers,
+              state.agent_caller,
+              state.artifact_stager,
+              state.notifier,
+              state.task_supervisor
+            )
+
+          state = put_in(state.tasks[ref], application.name)
 
           {:reply, {:ok, deployment}, state}
 
@@ -186,21 +214,27 @@ defmodule Still.Orchestrator do
 
   def handle_call({:trigger_rollback, actor, application, attrs}, _from, state)
       when is_map(state) do
-    if MapSet.member?(state.in_progress, application.name) do
+    attrs = Map.put(attrs, :durable_operations, state.durable)
+
+    if application_busy?(state, application) do
       {:reply, {:error, :deployment_in_progress}, state}
     else
       case validate_and_create_rollback(actor, application, attrs) do
         {:ok, deployment, servers} ->
           state = %{state | in_progress: MapSet.put(state.in_progress, application.name)}
 
-          spawn_rolling_task(
-            deployment,
-            application,
-            servers,
-            state.rollback_agent_caller,
-            state.artifact_stager,
-            state.notifier
-          )
+          ref =
+            spawn_rolling_task(
+              deployment,
+              application,
+              servers,
+              state.rollback_agent_caller,
+              state.artifact_stager,
+              state.notifier,
+              state.task_supervisor
+            )
+
+          state = put_in(state.tasks[ref], application.name)
 
           {:reply, {:ok, deployment}, state}
 
@@ -212,21 +246,27 @@ defmodule Still.Orchestrator do
 
   def handle_call({:trigger_restart, actor, application, attrs}, _from, state)
       when is_map(state) do
-    if MapSet.member?(state.in_progress, application.name) do
+    attrs = Map.put(attrs, :durable_operations, state.durable)
+
+    if application_busy?(state, application) do
       {:reply, {:error, :deployment_in_progress}, state}
     else
       case validate_and_create_restart(actor, application, attrs) do
         {:ok, deployment, servers} ->
           state = %{state | in_progress: MapSet.put(state.in_progress, application.name)}
 
-          spawn_rolling_task(
-            deployment,
-            application,
-            servers,
-            state.restart_agent_caller,
-            state.artifact_stager,
-            state.notifier
-          )
+          ref =
+            spawn_rolling_task(
+              deployment,
+              application,
+              servers,
+              state.restart_agent_caller,
+              state.artifact_stager,
+              state.notifier,
+              state.task_supervisor
+            )
+
+          state = put_in(state.tasks[ref], application.name)
 
           {:reply, {:ok, deployment}, state}
 
@@ -237,18 +277,97 @@ defmodule Still.Orchestrator do
   end
 
   def handle_call({:reconcile_routes, application}, _from, state) when is_map(state) do
-    route_caller = state.route_caller
-
-    Task.Supervisor.start_child(@task_supervisor, fn ->
-      reconcile_routes(application, route_caller)
-    end)
-
+    start_route_task(state, application)
     {:reply, :ok, state}
   end
 
   @impl true
   def handle_cast({:deployment_finished, app_name}, state) when is_map(state) do
     {:noreply, %{state | in_progress: MapSet.delete(state.in_progress, app_name)}}
+  end
+
+  def handle_cast({:operation_report, server_id, report}, state) when is_map(state) do
+    Operations.observe(server_id, report)
+    {:noreply, state}
+  end
+
+  def handle_cast({:refresh_routes, before}, state) when is_map(state) do
+    current = Applications.get_application_by_name(before.name)
+    if current && routing_changed?(before, current), do: start_route_task(state, current)
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:resume_pending, state) do
+    pending =
+      Repo.all(
+        from d in Still.Deployments.Deployment,
+          where: d.durable_operations and d.status in [:pending, :in_progress],
+          preload: [:application]
+      )
+
+    state =
+      Enum.reduce(pending, state, fn deployment, acc ->
+        app = deployment.application
+
+        if MapSet.member?(acc.in_progress, app.name) do
+          acc
+        else
+          caller =
+            case deployment.operation_kind do
+              :rollback -> acc.rollback_agent_caller
+              :restart -> acc.restart_agent_caller
+              :deploy -> acc.agent_caller
+            end
+
+          ref =
+            spawn_rolling_task(
+              deployment,
+              app,
+              Applications.list_application_servers(app),
+              caller,
+              acc.artifact_stager,
+              acc.notifier,
+              acc.task_supervisor
+            )
+
+          %{
+            acc
+            | in_progress: MapSet.put(acc.in_progress, app.name),
+              tasks: Map.put(acc.tasks, ref, app.name)
+          }
+        end
+      end)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) when is_map(state) do
+    {app, tasks} = Map.pop(state.tasks, ref)
+
+    in_progress =
+      if app && app not in Map.values(tasks),
+        do: MapSet.delete(state.in_progress, app),
+        else: state.in_progress
+
+    if app && state.durable, do: Process.send_after(self(), :resume_pending, 1_000)
+    {:noreply, %{state | tasks: tasks, in_progress: in_progress}}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    if Process.alive?(state.task_supervisor), do: Supervisor.stop(state.task_supervisor)
+    :ok
+  end
+
+  defp application_busy?(state, application) do
+    MapSet.member?(state.in_progress, application.name) or
+      Repo.exists?(
+        from d in Still.Deployments.Deployment,
+          where:
+            d.application_id == ^application.id and
+              d.durable_operations and d.status in [:pending, :in_progress]
+      )
   end
 
   defp routing_changed?(before, updated) do
@@ -259,12 +378,18 @@ defmodule Still.Orchestrator do
 
   # Fans the route-only spec out to each hosting agent, skipping servers
   # whose agent isn't currently connected.
-  defp reconcile_routes(application, route_caller) do
+  defp start_route_task(state, application) do
+    servers = Applications.list_application_servers(application)
+
+    Task.Supervisor.start_child(state.task_supervisor, fn ->
+      reconcile_routes(application, state.route_caller, servers)
+    end)
+  end
+
+  defp reconcile_routes(application, route_caller, servers) do
     spec = route_spec(application)
 
-    application
-    |> Applications.list_application_servers()
-    |> Enum.each(fn application_server ->
+    Enum.each(servers, fn application_server ->
       case AgentConnectionManager.get_agent_state(application_server.server_id) do
         %{node: node} -> route_caller.(node, spec)
         nil -> :ok
@@ -284,8 +409,10 @@ defmodule Still.Orchestrator do
   end
 
   defp validate_and_create(actor, application, attrs) do
-    servers = Applications.list_application_servers(application)
-    check_preconditions_and_create(actor, application, servers, attrs)
+    Applications.with_assignment_lock(application.id, fn ->
+      servers = Applications.list_application_servers(application)
+      check_preconditions_and_create(actor, application, servers, attrs)
+    end)
   end
 
   defp validate_and_create_rollback(actor, application, attrs) do
@@ -360,23 +487,29 @@ defmodule Still.Orchestrator do
          servers,
          agent_caller,
          artifact_stager,
-         notifier
+         notifier,
+         task_supervisor
        ) do
     orchestrator = self()
 
-    Task.Supervisor.start_child(@task_supervisor, fn ->
-      status = run_deploy_safely(deployment, application, servers, agent_caller, artifact_stager)
+    {:ok, pid} =
+      Task.Supervisor.start_child(task_supervisor, fn ->
+        status =
+          run_deploy_safely(deployment, application, servers, agent_caller, artifact_stager)
 
-      GenServer.cast(orchestrator, {:deployment_finished, application.name})
-      if notifier, do: send(notifier, {:deployment_complete, deployment.id, status})
-    end)
+        GenServer.cast(orchestrator, {:deployment_finished, application.name})
+        if notifier, do: send(notifier, {:deployment_complete, deployment.id, status})
+      end)
+
+    Process.monitor(pid)
   end
 
-  # The deploy task is unlinked (it runs under @task_supervisor), but an
+  # The deploy task is unlinked (it runs under the private task supervisor), but an
   # unhandled crash mid-deploy — a `!` Repo call on a locked DB, an :exit from a
   # remote GenServer.call to a node that just died — would still skip the
   # `deployment_finished` cast and leave the app wedged in_progress. Convert any
-  # crash into a failed deployment so the cast and notifier always run.
+  # crash into an outcome so the cast and notifier always run. Durable work
+  # remains nonterminal on observer failure and is resumed from persisted intent.
   defp run_deploy_safely(deployment, application, servers, agent_caller, artifact_stager) do
     execute_rolling_deploy(deployment, application, servers, agent_caller, artifact_stager)
   rescue
@@ -387,10 +520,22 @@ defmodule Still.Orchestrator do
 
   defp fail_crashed(deployment, application, message) do
     Logger.error("deployment #{deployment.id} (#{application.name}) crashed: #{message}")
-    failed = Deployments.fail_deployment!(deployment, message)
-    record_terminal_audit(application, failed, :failed, message)
-    broadcast_update(application, deployment, %{status: :failed, error: message})
-    :failed
+
+    if deployment.durable_operations do
+      # Remote work may already be running. Leave durable intent nonterminal and
+      # restart observation; the database gate prevents new conflicting work.
+      deployment
+      |> Ecto.Changeset.change(error: "observation interrupted: " <> message)
+      |> Repo.update!()
+
+      Process.send_after(__MODULE__, :resume_pending, 2_000)
+      :unknown
+    else
+      failed = Deployments.fail_deployment!(deployment, message)
+      record_terminal_audit(application, failed, :failed, message)
+      broadcast_update(application, deployment, %{status: :failed, error: message})
+      :failed
+    end
   end
 
   defp execute_rolling_deploy(deployment, application, servers, agent_caller, artifact_stager) do
@@ -398,10 +543,8 @@ defmodule Still.Orchestrator do
 
     # six:ignore:start
     result =
-      with {:ok, prepared} <- stage_artifact(application, deployment, artifact_stager) do
-        Enum.reduce_while(servers, :ok, fn as, :ok ->
-          deploy_to_server(prepared, application, as, agent_caller)
-        end)
+      with {:ok, prepared} <- prepare_or_resume(application, deployment, artifact_stager) do
+        run_rollout(prepared, application, servers, agent_caller)
       end
 
     # six:ignore:stop
@@ -411,6 +554,7 @@ defmodule Still.Orchestrator do
         completed = Deployments.complete_deployment!(deployment)
         record_terminal_audit(application, completed, :completed, nil)
         broadcast_update(application, deployment, %{status: :completed})
+        maybe_refresh_routes(application, deployment)
         :completed
 
       {:error, reason} ->
@@ -423,6 +567,7 @@ defmodule Still.Orchestrator do
         failed = Deployments.fail_deployment!(deployment, error)
         record_terminal_audit(application, failed, :failed, error)
         broadcast_update(application, deployment, %{status: :failed, error: error})
+        maybe_refresh_routes(application, deployment)
         :failed
     end
   end
@@ -484,8 +629,94 @@ defmodule Still.Orchestrator do
 
   defp format_reason(reason), do: FailureReason.headline(reason)
 
+  defp maybe_refresh_routes(_before, %{durable_operations: false}), do: :ok
+
+  defp maybe_refresh_routes(before, _deployment) do
+    # Route repair is best-effort and cannot change an already-settled outcome.
+    GenServer.cast(__MODULE__, {:refresh_routes, before})
+  end
+
+  defp prepare_or_resume(application, deployment, stager) do
+    if deployment.durable_operations and Operations.for_deployment(deployment.id) != [] do
+      {:ok, deployment}
+    else
+      stage_artifact(application, deployment, stager)
+    end
+  end
+
+  defp execute_durable(deployment, application, servers) do
+    if Operations.for_deployment(deployment.id) == [] do
+      {:ok, _} = Repo.transaction(fn -> prepare_operations(deployment, application, servers) end)
+    end
+
+    deployment.id
+    |> Operations.for_deployment()
+    |> Enum.reduce_while(:ok, fn operation, :ok ->
+      await_operation(operation, deployment, application)
+    end)
+  end
+
+  defp run_rollout(%{durable_operations: true} = deployment, app, servers, _caller),
+    do: execute_durable(deployment, app, servers)
+
+  defp run_rollout(deployment, app, servers, caller) do
+    Enum.reduce_while(servers, :ok, fn assignment, :ok ->
+      deploy_to_server(deployment, app, assignment, caller)
+    end)
+  end
+
+  defp prepare_operations(deployment, app, servers) do
+    servers
+    |> Enum.with_index()
+    |> Enum.each(fn {assignment, position} ->
+      step = Deployments.get_step_for_server!(deployment.id, assignment.server_id)
+      spec = build_deploy_request(app, deployment, assignment)
+      hooks = Map.filter(spec.hooks, &hook_on_host?(&1, position, length(servers)))
+      Operations.ensure(deployment, step, %{spec | hooks: hooks}, position)
+    end)
+  end
+
+  defp hook_on_host?({event, %{scope: :per_rollout}}, position, count)
+       when event in [:post_deploy, :post_rollback],
+       do: position == count - 1
+
+  defp hook_on_host?({_event, %{scope: :per_rollout}}, position, _count), do: position == 0
+  defp hook_on_host?(_hook, _position, _count), do: true
+
+  defp await_operation(operation, deployment, app) do
+    step = Deployments.get_deployment_step!(operation.step_id)
+
+    if step.status == :completed do
+      {:cont, :ok}
+    else
+      finish_operation(operation, deployment, app, Deployments.start_deployment_step!(step))
+    end
+  end
+
+  defp finish_operation(operation, deployment, app, step) do
+    assignment =
+      Repo.get_by(ApplicationServer, application_id: app.id, server_id: operation.server_id)
+
+    case Operations.await(operation) do
+      {:ok, _} ->
+        complete_step(deployment, app, assignment || %{server_id: operation.server_id}, step)
+
+      {:error, reason} ->
+        fail_step(deployment, app, %{server_id: operation.server_id}, step, reason)
+    end
+  end
+
   defp deploy_to_server(deployment, application, application_server, agent_caller) do
     step = Deployments.get_step_for_server!(deployment.id, application_server.server_id)
+
+    if step.status == :completed do
+      {:cont, :ok}
+    else
+      dispatch_step(deployment, application, application_server, agent_caller, step)
+    end
+  end
+
+  defp dispatch_step(deployment, application, application_server, agent_caller, step) do
     spec = build_deploy_request(application, deployment, application_server)
 
     case AgentConnectionManager.get_agent_state(application_server.server_id) do
@@ -524,7 +755,9 @@ defmodule Still.Orchestrator do
     # front made servers that failed (or were never reached) keep desired=new
     # while running old — permanent phantom "drift" the reconciliation loop logs
     # forever on an otherwise-healthy fleet.
-    _ = Applications.set_desired_version(application_server, deployment.version)
+    if match?(%ApplicationServer{}, application_server) do
+      _ = Applications.set_desired_version(application_server, deployment.version)
+    end
 
     broadcast_update(application, deployment, %{
       server_id: application_server.server_id,
