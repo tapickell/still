@@ -54,6 +54,7 @@ defmodule Still.Application do
       {Still.Agent.NodeMetrics, controller_node: controller},
       {Still.Agent.DeployLogCollector, controller_node: controller},
       {Still.Agent.DeploymentManager, []},
+      {Still.Agent.OperationManager, []},
       {Still.Agent.ConsoleManager, []},
       {Still.Agent.HealthMonitor, reporter: &NodeConnector.report_health_transition/1}
     ]
@@ -74,12 +75,7 @@ defmodule Still.Application do
   end
 
   defp common_children do
-    [
-      StillWeb.Telemetry,
-      # Supervises the Orchestrator's fire-and-forget deploy/route tasks so a
-      # crashing task can't take the coordinator (or sibling deploys) down.
-      {Task.Supervisor, name: Still.Orchestrator.TaskSupervisor}
-    ]
+    [StillWeb.Telemetry]
   end
 
   defp controller_base_children do
@@ -125,6 +121,7 @@ defmodule Still.Application do
       {Still.Agent.NodeMetrics, controller_node: Node.self()},
       {Still.Agent.DeployLogCollector, controller_node: Node.self()},
       {Still.Agent.DeploymentManager, []},
+      {Still.Agent.OperationManager, []},
       {Still.Agent.ConsoleManager, []},
       {Still.Agent.HealthMonitor, reporter: &NodeConnector.report_health_transition/1}
     ]

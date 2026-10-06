@@ -80,7 +80,8 @@ defmodule StillWeb.ApplicationServerController do
 
   def delete(%Plug.Conn{} = conn, %{"id" => id}) do
     assignment = Applications.get_application_server!(conn.assigns.current_scope, id)
-    {:ok, _} = Applications.unassign_server(Actor.from_conn(conn), assignment)
-    send_resp(conn, :no_content, "")
+
+    with {:ok, _} <- Applications.unassign_server(Actor.from_conn(conn), assignment),
+         do: send_resp(conn, :no_content, "")
   end
 end

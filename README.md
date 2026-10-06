@@ -334,9 +334,9 @@ Once new deployments exist, do not downgrade only the binaries: older agents do
 not understand the new directory identities. Restore a coordinated backup if a
 downgrade is necessary.
 
-This phase does not add durable asynchronous operations, atomic fleet rollback,
-or crash recovery between traffic switching and state persistence. Those remain
-later milestones in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+Durable asynchronous operations and conservative recovery are described in
+[DURABLE_OPERATIONS.md](DURABLE_OPERATIONS.md). Automatic fleet rollback,
+full desired-state reconciliation, and autoscaling remain later milestones.
 
 ## Restart
 
@@ -367,7 +367,10 @@ curl -sS -X PATCH $STILL_URL/api/applications/hello \
   -d '{"maintenance": false}'
 ```
 
-The change takes effect immediately. The route is reconciled on the controller and on each hosting agent.
+When idle, the route is reconciled on the controller and hosting agents immediately.
+During a durable deployment, agent-local routing changes wait until the operation
+settles; an unknown/paused operation can delay them. Inspect live Caddy or HTTP
+responses before assuming maintenance is serving. See [durable operations](DURABLE_OPERATIONS.md).
 
 ## Remote console
 

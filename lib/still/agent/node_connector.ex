@@ -22,6 +22,7 @@ defmodule Still.Agent.NodeConnector do
   require Logger
 
   alias Still.Agent.ApplicationState
+  alias Still.Agent.OperationManager
   alias Still.Agent.StatePersistence
   alias Still.Agent.Systemd
   alias Still.Agent.SystemInfo
@@ -117,6 +118,17 @@ defmodule Still.Agent.NodeConnector do
     {:noreply, state}
   end
 
+  def handle_cast({:report_operation, report}, state) when is_map(state) do
+    if state.server_id do
+      GenServer.cast(
+        {Still.Orchestrator, state.controller},
+        {:operation_report, state.server_id, report}
+      )
+    end
+
+    {:noreply, state}
+  end
+
   def handle_cast(
         {:report_application_state, application_name, %ApplicationState{} = app_state},
         %{} = state
@@ -207,7 +219,8 @@ defmodule Still.Agent.NodeConnector do
       node: Node.self(),
       connected_at: DateTime.utc_now(),
       system_info: SystemInfo.collect(),
-      capabilities: [:immutable_releases],
+      capabilities: [:immutable_releases, :durable_operations_v1],
+      operations: operation_reports(),
       applications: current_applications()
     }
   end
@@ -219,6 +232,12 @@ defmodule Still.Agent.NodeConnector do
         {:error, _} -> []
       end
     end)
+  end
+
+  defp operation_reports do
+    if Process.whereis(OperationManager),
+      do: OperationManager.reports(),
+      else: []
   end
 
   defp state_to_report(application_name, %ApplicationState{} = state) do

@@ -20,6 +20,8 @@ defmodule Still.Protocol.DeployRequest do
     :version,
     :artifact_url,
     :deployment_id,
+    :operation_id,
+    :generation,
     :release_id,
     :revision_id,
     :artifact_digest,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-suite=${1:?Specify scripts, unit, integration, or root}
+suite=${1:?Specify scripts, unit, integration, root, or coverage}
 shift
 cd /workspace
 
@@ -37,7 +37,7 @@ case "$suite" in
     fi
     selection=(--only integration)
     ;;
-  root)
+  root|coverage)
     [[ $(id -u) == 0 ]] || { printf 'Root suite requires root inside the container.\n' >&2; exit 1; }
     [[ $(cat /proc/1/comm) == systemd ]] || { printf 'systemd must be PID 1.\n' >&2; exit 1; }
     systemctl show --property=Version --value >/dev/null
@@ -45,13 +45,18 @@ case "$suite" in
     systemd-run --quiet --wait --collect --unit=still-test-preflight /bin/true
     (cd "$STILL_RELEASE_FIXTURES_DIR" && sha256sum --check SHA256SUMS && cat BUILD_INFO)
     selection=(--only integration_root)
+    if [[ $suite == coverage ]]; then selection=(--include integration --include integration_root); fi
     ;;
   *) printf 'Unknown suite: %s\n' "$suite" >&2; exit 2 ;;
 esac
 
 mkdir -p /workspace/.test-results
 export STILL_TEST_REPORT="/workspace/.test-results/${suite}.json"
-mix test "${selection[@]}" "$@"
+if [[ $suite == coverage ]]; then
+  mix six --minimum-coverage 100 -- "${selection[@]}" "$@"
+else
+  mix test "${selection[@]}" "$@"
+fi
 # A missing report, skipped prerequisite, or selector matching nothing must not
 # turn an untested environment green. Exclusions from --only are intentional.
 elixir -pa _build/test/lib/jason/ebin -e '

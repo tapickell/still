@@ -28,6 +28,17 @@ defmodule StillWeb.FallbackController do
     |> json(%{error: %{message: "A deployment is already in progress for this application"}})
   end
 
+  def call(%Plug.Conn{} = conn, {:error, :operation_history_retained}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        message:
+          "Durable operation history protects this resource; coordinated agent decommission is required"
+      }
+    })
+  end
+
   def call(%Plug.Conn{} = conn, {:error, :no_servers_assigned}) do
     conn
     |> put_status(:conflict)

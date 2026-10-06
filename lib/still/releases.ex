@@ -34,13 +34,18 @@ defmodule Still.Releases do
     hooks =
       application
       |> Applications.list_hooks_for()
-      |> Map.new(fn hook -> {hook.event, Map.take(hook, [:script, :timeout_ms])} end)
+      |> Map.new(fn hook -> {hook.event, hook_snapshot(hook)} end)
 
     config
     |> Map.merge(%{health_check: health_check, hooks: hooks})
     |> Jason.encode!()
     |> Jason.decode!()
   end
+
+  defp hook_snapshot(%{scope: :per_rollout} = hook),
+    do: Map.take(hook, [:script, :timeout_ms, :scope])
+
+  defp hook_snapshot(hook), do: Map.take(hook, [:script, :timeout_ms])
 
   @doc "Stages exact bytes and binds a deployment to its immutable release and configuration snapshot."
   @spec prepare(Application.t(), Deployment.t()) :: {:ok, Deployment.t()} | {:error, term()}
@@ -183,7 +188,13 @@ defmodule Still.Releases do
       for {event, hook} <- hooks,
           hook != nil,
           into: %{},
-          do: {event, %{script: hook["script"], timeout_ms: hook["timeout_ms"]}}
+          do:
+            {event,
+             %{
+               script: hook["script"],
+               timeout_ms: hook["timeout_ms"],
+               scope: if(hook["scope"] == "per_rollout", do: :per_rollout, else: :per_replica)
+             }}
 
     fields
     |> Map.put(:type, Enum.find(Application.types(), &(Atom.to_string(&1) == config["type"])))

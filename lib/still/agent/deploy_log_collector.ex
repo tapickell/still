@@ -9,8 +9,8 @@ defmodule Still.Agent.DeployLogCollector do
 
   Capture is bounded by the deploy window: it starts from the journal cursor
   taken at `begin/3` and stops at `finish/0` — it never tails a running app.
-  One deploy at a time (the `DeploymentManager` serializes them), so the
-  collector holds a single capture.
+  Each collector holds one capture. Durable workers own separate unlinked,
+  owner-monitored collectors; the named instance supports serialized legacy calls.
   """
 
   use GenServer
@@ -35,14 +35,17 @@ defmodule Still.Agent.DeployLogCollector do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @doc "Starts an unlinked private collector which monitors its deployment worker's lifetime."
+  def start_owned(opts) when is_list(opts), do: GenServer.start(__MODULE__, opts)
+
   @doc """
   Begins capturing the journal for `application@slot`, tagging casts with
   `deployment_id`. Records the journal cursor now so capture covers only the
   window from here on. No-op when `deployment_id` or the agent's `server_id`
   is missing — there is nothing to attribute the log to.
   """
-  def begin(deployment_id, application, slot) when is_binary(application) do
-    GenServer.call(__MODULE__, {:begin, deployment_id, application, slot}, @call_timeout_ms)
+  def begin(deployment_id, application, slot, server \\ __MODULE__) when is_binary(application) do
+    GenServer.call(server, {:begin, deployment_id, application, slot}, @call_timeout_ms)
   end
 
   @doc """
@@ -51,17 +54,20 @@ defmodule Still.Agent.DeployLogCollector do
   `DeploymentManager` captures the journal *before* it stops a failed slot —
   capture-then-stop. No-op when nothing is being captured.
   """
-  def finish do
-    GenServer.call(__MODULE__, :finish, @call_timeout_ms)
+  def finish(server \\ __MODULE__) do
+    GenServer.call(server, :finish, @call_timeout_ms)
   end
 
   @impl true
   def init(opts) when is_list(opts) do
+    owner = Keyword.get(opts, :owner)
+
     {:ok,
      %{
        controller: Keyword.get(opts, :controller_node, node()),
        interval: Keyword.get(opts, :interval_ms, @default_interval_ms),
-       capture: nil
+       capture: nil,
+       owner_ref: if(is_pid(owner), do: Process.monitor(owner))
      }}
   end
 
@@ -85,6 +91,10 @@ defmodule Still.Agent.DeployLogCollector do
 
   # six:ignore:next
   def handle_info(:tick, state), do: {:noreply, tick_capture(state)}
+
+  def handle_info({:DOWN, ref, :process, _owner, _reason}, %{owner_ref: ref} = state) do
+    {:stop, :normal, state}
+  end
 
   # six:ignore:start
   # Everything below only runs once a capture is live, which requires the

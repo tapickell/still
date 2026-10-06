@@ -38,6 +38,7 @@ defmodule Still.Agent.DeploymentManager do
   alias Still.Agent.DeployLogCollector
   alias Still.Agent.HealthMonitor
   alias Still.Agent.NodeConnector
+  alias Still.Agent.OperationManager
   alias Still.Agent.ReleaseFiles
   alias Still.Agent.StatePersistence
   alias Still.Agent.Systemd
@@ -132,7 +133,40 @@ defmodule Still.Agent.DeploymentManager do
   end
 
   @impl true
-  def handle_call({:deploy, spec}, _from, state) when is_map(state) do
+  def handle_call({kind, spec}, from, state)
+      when kind in [:deploy, :rollback, :restart, :reconcile_route] do
+    case legacy_admission(kind, spec.application) do
+      :ok ->
+        OperationManager.locked(spec.application, fn ->
+          legacy_locked_call(kind, spec, from, state)
+        end)
+
+      {:error, _} = error ->
+        {:reply, error, state}
+    end
+  end
+
+  defp legacy_locked_call(kind, spec, from, state) do
+    case legacy_admission(kind, spec.application) do
+      :ok -> legacy_call({kind, spec}, from, state)
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  defp legacy_admission(kind, app) do
+    cond do
+      OperationManager.busy?(app) ->
+        {:error, :operation_in_progress}
+
+      kind != :reconcile_route and not OperationManager.legacy_allowed?(app) ->
+        {:error, :durable_protocol_required}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp legacy_call({:deploy, spec}, _from, state) when is_map(state) do
     steps = state.step_provider.(spec.type)
 
     case build_context(spec) do
@@ -154,7 +188,7 @@ defmodule Still.Agent.DeploymentManager do
     end
   end
 
-  def handle_call({:rollback, spec}, _from, state) when is_map(state) do
+  defp legacy_call({:rollback, spec}, _from, state) when is_map(state) do
     case build_rollback_context(spec) do
       {:ok, context} ->
         steps = state.rollback_step_provider.(spec.type)
@@ -174,7 +208,7 @@ defmodule Still.Agent.DeploymentManager do
     end
   end
 
-  def handle_call({:restart, spec}, _from, state) when is_map(state) do
+  defp legacy_call({:restart, spec}, _from, state) when is_map(state) do
     case build_restart_context(spec) do
       {:ok, context} ->
         steps = state.restart_step_provider.(spec.type)
@@ -196,7 +230,7 @@ defmodule Still.Agent.DeploymentManager do
     end
   end
 
-  def handle_call({:reconcile_route, spec}, _from, state) when is_map(state) do
+  defp legacy_call({:reconcile_route, spec}, _from, state) when is_map(state) do
     {:reply, reconcile_route_now(spec), state}
   end
 
@@ -233,6 +267,164 @@ defmodule Still.Agent.DeploymentManager do
     run_steps(steps, context)
   after
     File.rm(context.tarball_path)
+  end
+
+  @doc "Executes a durable operation using write-ahead checkpoints; ambiguous work is never replayed."
+  @spec execute_operation(map(), (map() -> :ok)) :: :ok
+  def execute_operation(record, checkpoint) when is_map(record) and is_function(checkpoint, 1) do
+    {:ok, collector} =
+      DeployLogCollector.start_owned(
+        owner: self(),
+        controller_node: Application.get_env(:still, :controller_node, node())
+      )
+
+    # A dying collector cannot kill the worker; an owner monitor prevents leaks.
+
+    Process.put(:operation_log_collector, collector)
+
+    try do
+      case operation_context(record) do
+        {:ok, ctx, completed} ->
+          steps = operation_steps(record.request.kind, ctx.spec.type)
+          execute_journaled_steps(steps, ctx, completed, checkpoint)
+
+        {:unknown, reason} ->
+          checkpoint.(%{status: :unknown, error: inspect(reason)})
+
+        {:error, reason} ->
+          checkpoint.(%{status: :failed, error: inspect(reason)})
+      end
+    after
+      finish_log_capture()
+      if Process.alive?(collector), do: GenServer.stop(collector)
+      Process.delete(:operation_log_collector)
+    end
+  end
+
+  defp operation_steps(:deploy, type), do: default_steps_for(type)
+  defp operation_steps(:rollback, type), do: default_rollback_steps_for(type)
+  defp operation_steps(:restart, type), do: default_restart_steps_for(type)
+
+  defp operation_context(%{context: nil, request: request}) do
+    spec =
+      request.spec
+      |> Map.put(:operation_id, request.id)
+      |> Map.put(:generation, request.generation)
+
+    result =
+      case request.kind do
+        :deploy -> build_context(spec)
+        :rollback -> build_rollback_context(spec)
+        :restart -> build_restart_context(spec)
+      end
+
+    with {:ok, context} <- result, do: {:ok, context, []}
+  end
+
+  defp operation_context(%{context: ctx, completed: done, phase: phase})
+       when phase in [:pre_deploy, :release, :post_deploy, :pre_rollback, :post_rollback] do
+    if is_nil(Map.get(ctx.spec.hooks || %{}, phase)),
+      do: {:ok, ctx, Enum.uniq(done ++ [phase])},
+      else: {:unknown, {:ambiguous_side_effect, phase}}
+  end
+
+  defp operation_context(%{phase: :starting}), do: {:unknown, {:ambiguous_side_effect, :starting}}
+
+  defp operation_context(%{context: ctx, completed: done, phase: phase})
+       when phase in [:switching, :cleanup] do
+    # Repeat cleanup from the saved pre-operation state, never infer its commit.
+    done = if phase == :switching, do: Enum.uniq(done ++ [phase]), else: done
+    resume_if(observe_serving_context(ctx), ctx, done, {:requires_inspection, phase})
+  end
+
+  defp operation_context(%{context: ctx, completed: done}) do
+    cond do
+      :switching in done ->
+        resume_if(observe_serving_context(ctx), ctx, done, :serving_state_changed)
+
+      :starting in done ->
+        resume_if(observe_target(ctx), ctx, done, :target_not_ready)
+
+      true ->
+        {:ok, ctx, done}
+    end
+  end
+
+  defp resume_if(:ok, ctx, done, _reason), do: {:ok, ctx, done}
+  defp resume_if(_observation, _ctx, _done, reason), do: {:unknown, reason}
+
+  defp execute_journaled_steps(steps, ctx, completed, checkpoint) do
+    result =
+      Enum.reduce_while(steps, {:ok, ctx, completed}, &journaled_step(&1, &2, checkpoint))
+
+    case result do
+      {:ok, final, _} ->
+        finish_log_capture()
+        File.rm(final.tarball_path)
+        checkpoint.(%{status: :succeeded, phase: nil, version: final.spec.version, error: nil})
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  defp journaled_step({phase, _} = step, {:ok, ctx, done}, checkpoint) do
+    if phase in done,
+      do: {:cont, {:ok, ctx, done}},
+      else: run_journaled_step(step, ctx, done, checkpoint)
+  end
+
+  defp run_journaled_step({phase, _} = step, ctx, done, checkpoint) do
+    checkpoint.(%{status: :running, phase: phase, completed: done, context: ctx, error: nil})
+
+    case run_steps([step], ctx) do
+      {:ok, updated} ->
+        done = done ++ [phase]
+        checkpoint.(%{phase: nil, completed: done, context: updated})
+        {:cont, {:ok, updated, done}}
+
+      {:error, reason} = error ->
+        finish_log_capture()
+        stop_target_on_health_failure(error, ctx, %{})
+        status = if phase in [:switching, :cleanup], do: :unknown, else: :failed
+        checkpoint.(%{status: status, error: inspect(reason)})
+        {:halt, error}
+    end
+  end
+
+  defp observe_target(ctx) do
+    with :ok <- ReleaseFiles.verify(ctx.release_dir, ctx.spec),
+         {:ok, target} when target == ctx.release_dir <- File.read_link(ctx.target_symlink) do
+      observe_process(ctx)
+    else
+      _ -> {:unknown, :release_or_symlink_changed}
+    end
+  end
+
+  defp observe_process(%{spec: %{type: :static_site}}), do: :ok
+
+  defp observe_process(ctx) do
+    case Systemd.info_for(ctx.spec.application, ctx.target_slot) do
+      %{active_state: "active"} -> observe_health(ctx)
+      _ -> {:unknown, :target_not_running}
+    end
+  end
+
+  defp observe_health(ctx) do
+    url = "http://localhost:#{ctx.target_port}#{ctx.spec.health_check.path}"
+
+    case Req.get(url, retry: false, receive_timeout: 2_000) do
+      {:ok, %{status: code}} when code in 200..299 -> :ok
+      _ -> {:unknown, :target_not_ready}
+    end
+  end
+
+  defp observe_serving_context(ctx) do
+    with :ok <- observe_target(ctx), {:ok, config} <- CaddyManager.get_config() do
+      route = build_app_route(ctx)
+      routes = get_in(config, ["apps", "http", "servers", "still", "routes"]) || []
+      if route in routes, do: :ok, else: {:unknown, :route_changed}
+    end
   end
 
   # A deploy/rollback that fails its health check has just started the target
@@ -658,9 +850,7 @@ defmodule Still.Agent.DeploymentManager do
   end
 
   defp switch_caddy(ctx) when is_map(ctx) do
-    with {:ok, config} <- CaddyManager.get_config(),
-         {:ok, new_config} <- put_app_route(config, build_app_route(ctx)),
-         :ok <- CaddyManager.load_config(new_config) do
+    with :ok <- CaddyManager.update(&put_app_route(&1, build_app_route(ctx))) do
       {:ok, ctx}
     end
   end
@@ -765,6 +955,8 @@ defmodule Still.Agent.DeploymentManager do
       previous_release_id: previous_release_id_for(ctx),
       current_revision_id: Map.get(ctx.spec, :revision_id),
       previous_revision_id: ctx.current_state && ctx.current_state.current_revision_id,
+      operation_id: Map.get(ctx.spec, :operation_id),
+      generation: Map.get(ctx.spec, :generation),
       last_health_check_at: nil
     }
 
@@ -845,8 +1037,13 @@ defmodule Still.Agent.DeploymentManager do
   # (call timeout) or a collector that died after the whereis check can never
   # crash the deploy — log capture must never break a deploy.
   defp begin_log_capture(ctx) do
-    if Process.whereis(DeployLogCollector) do
-      DeployLogCollector.begin(ctx.deployment_id, ctx.spec.application, ctx.target_slot)
+    if Process.get(:operation_log_collector) || Process.whereis(DeployLogCollector) do
+      DeployLogCollector.begin(
+        ctx.deployment_id,
+        ctx.spec.application,
+        ctx.target_slot,
+        Process.get(:operation_log_collector, DeployLogCollector)
+      )
     end
 
     :ok
@@ -859,8 +1056,8 @@ defmodule Still.Agent.DeploymentManager do
   # start). Same best-effort `catch` as begin — a finalize hiccup must not crash
   # the deploy or swallow its reply.
   defp finish_log_capture do
-    if Process.whereis(DeployLogCollector) do
-      DeployLogCollector.finish()
+    if Process.get(:operation_log_collector) || Process.whereis(DeployLogCollector) do
+      DeployLogCollector.finish(Process.get(:operation_log_collector, DeployLogCollector))
     end
 
     :ok
